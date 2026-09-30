@@ -68,7 +68,27 @@ type Delivery struct {
 	Message        Message
 	SubscriptionID string
 	RuleIDs        []string
+	// RuleVersion is the version of the subscription's rule set that matched
+	// the message. The initial Subscribe set is version 1; every successful
+	// UpdateRules call advances it by one. A Publish call matches against a
+	// single atomic snapshot, so this value identifies exactly which revision
+	// of the rules produced the delivery.
+	RuleVersion int
 }
+
+// OverflowPolicy decides what happens when a slow subscriber's bounded
+// buffer is full and a new message matches.
+type OverflowPolicy string
+
+const (
+	// KeepOldest retains buffered messages and drops the newest message.
+	// This is the default policy.
+	KeepOldest OverflowPolicy = "keep_oldest"
+	// KeepNewest evicts the oldest buffered message to make room for the
+	// newest one. The evicted message is recorded with reason
+	// "subscriber_buffer_evicted".
+	KeepNewest OverflowPolicy = "keep_newest"
+)
 
 type RecordKind string
 
@@ -86,6 +106,9 @@ type Record struct {
 	Topic          string
 	SubscriptionID string
 	RuleIDs        []string
+	// RuleVersion is the rule-set version the message matched before it was
+	// dropped or evicted; zero for records that are not tied to a match.
+	RuleVersion int
 }
 
 type Option func(*Router) error
@@ -122,6 +145,22 @@ func WithSubscriptionBufferSize(size int) SubscribeOption {
 	}
 }
 
+// WithOverflowPolicy selects how a subscriber behaves while its buffer is
+// full. KeepOldest drops the incoming (newest) message; KeepNewest evicts
+// the oldest buffered message instead. The choice affects only that
+// subscriber; other subscribers are never impacted by a slow consumer.
+func WithOverflowPolicy(policy OverflowPolicy) SubscribeOption {
+	return func(sub *subscription) error {
+		switch policy {
+		case KeepOldest, KeepNewest:
+			sub.overflow = policy
+		default:
+			return fmt.Errorf("%w: unknown overflow policy %q", ErrInvalidSubscription, policy)
+		}
+		return nil
+	}
+}
+
 type Subscription struct {
 	ID         string
 	Deliveries <-chan Delivery
@@ -129,10 +168,31 @@ type Subscription struct {
 
 type subscription struct {
 	id         string
-	rules      []Rule
 	bufferSize int
+	overflow   OverflowPolicy
 	deliveries chan Delivery
-	inFlight   sync.WaitGroup
+
+	// direct subscriptions (KeepOldest) publish straight into the buffered
+	// channel; pump/ring fields stay unused.
+	direct bool
+
+	mu      sync.Mutex
+	rules   []Rule
+	version int
+
+	// queued is the bounded ring of accepted-but-not-yet-sent deliveries.
+	queued []Delivery
+	head   int
+	count  int
+	closed bool
+
+	// pending holds the oldest queued delivery while the pump is waiting
+	// for the consumer to accept it. Keeping it out of the ring lets the
+	// pump continue accepting newer messages (and apply KeepNewest).
+	pending *Delivery
+
+	notify   chan struct{}
+	inFlight sync.WaitGroup
 }
 
 type Router struct {
@@ -171,16 +231,31 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 
 	entry := &subscription{
 		id:         id,
-		rules:      prepared,
 		bufferSize: r.bufferSize,
+		overflow:   KeepOldest,
 	}
 	for _, option := range options {
 		if err := option(entry); err != nil {
 			return Subscription{}, err
 		}
 	}
-	ch := make(chan Delivery, entry.bufferSize)
+
+	var ch chan Delivery
+	if entry.overflow == KeepNewest {
+		ch = make(chan Delivery)
+	} else {
+		ch = make(chan Delivery, entry.bufferSize)
+	}
 	entry.deliveries = ch
+	entry.rules = prepared
+	entry.version = 1
+	if entry.overflow == KeepNewest {
+		entry.direct = false
+		entry.queued = make([]Delivery, maxInt(entry.bufferSize, 1))
+		entry.notify = make(chan struct{}, 1)
+	} else {
+		entry.direct = true
+	}
 
 	r.mu.Lock()
 	if _, exists := r.subscribers[id]; exists {
@@ -190,7 +265,55 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 	r.subscribers[id] = entry
 	r.mu.Unlock()
 
+	if entry.overflow == KeepNewest {
+		go entry.pump(r)
+	}
+
 	return Subscription{ID: id, Deliveries: ch}, nil
+}
+
+// snapshot returns the currently active rules and their version as one
+// atomic read.
+func (s *subscription) snapshot() ([]Rule, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rules, s.version
+}
+
+// pump forwards accepted deliveries to the consumer in order. A delivery is
+// held in pending until the consumer accepts it, so a slow consumer cannot
+// block Publish and never affects how newer messages enter the ring.
+func (s *subscription) pump(router *Router) {
+	for {
+		s.mu.Lock()
+		if s.pending == nil {
+			if s.count > 0 {
+				delivery := s.queued[s.head]
+				s.queued[s.head] = Delivery{}
+				s.head = (s.head + 1) % len(s.queued)
+				s.count--
+				s.pending = &delivery
+			} else if s.closed {
+				s.mu.Unlock()
+				close(s.deliveries)
+				return
+			}
+		}
+		delivery := s.pending
+		notify := s.notify
+		s.mu.Unlock()
+
+		if delivery != nil {
+			s.deliveries <- *delivery
+			s.mu.Lock()
+			s.pending = nil
+			s.mu.Unlock()
+			continue
+		}
+
+		_ = notify
+		<-notify
+	}
 }
 
 func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
@@ -227,9 +350,84 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 		})
 		return err
 	}
+	entry.mu.Lock()
 	entry.rules = prepared
+	entry.version++
+	entry.mu.Unlock()
 	r.mu.Unlock()
 	return nil
+}
+
+// offer accepts a matched delivery into the bounded buffer. The return value
+// is the delivery that had to be discarded (if any) along with a stable
+// copy; offers never block on the consumer.
+func (s *subscription) deliver(router *Router, delivery Delivery) (Delivery, bool) {
+	if s.direct {
+		select {
+		case s.deliveries <- delivery:
+			return Delivery{}, false
+		default:
+			return delivery, true
+		}
+	}
+	return s.offer(delivery)
+}
+
+func (s *subscription) offer(delivery Delivery) (Delivery, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return delivery, true
+	}
+
+	// The ring holds up to bufferSize buffered messages; the pump's
+	// active handoff (pending) is one additional non-reclaimable slot.
+	// KeepNewest always makes room for the newest message by evicting the
+	// oldest buffered message when the ring is full. The pinned handoff
+	// message, if any, is the oldest message still in the system and is
+	// never reclaimed mid-send.
+	if s.count < s.bufferSize {
+		capacity := len(s.queued)
+		s.queued[(s.head+s.count)%capacity] = delivery
+		s.count++
+		if s.pending == nil && s.count == 1 {
+			s.signal()
+		}
+		return Delivery{}, false
+	}
+
+	if s.bufferSize == 0 {
+		return delivery, true
+	}
+	capacity := len(s.queued)
+	evicted := s.queued[s.head]
+	s.queued[s.head] = Delivery{}
+	s.head = (s.head + 1) % capacity
+	s.queued[(s.head+s.count-1)%capacity] = delivery
+	return evicted, false
+}
+
+// close marks the subscription closed; the pump finishes sending every
+// queued message and then closes the consumer channel.
+func (s *subscription) close() {
+	s.mu.Lock()
+	s.closed = true
+	direct := s.direct
+	ch := s.deliveries
+	if !direct {
+		s.signal()
+	}
+	s.mu.Unlock()
+	if direct {
+		close(ch)
+	}
+}
+
+func (s *subscription) signal() {
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
 }
 
 // Publish dispatches a message using one atomic subscription/rule snapshot.
@@ -248,20 +446,21 @@ func (r *Router) Publish(message Message) error {
 		return err
 	}
 
-	type target struct {
+	r.mu.RLock()
+	type resolved struct {
 		entry   *subscription
 		ruleIDs []string
+		version int
 	}
-
-	r.mu.RLock()
-	targets := make([]target, 0, len(r.subscribers))
+	targets := make([]resolved, 0, len(r.subscribers))
 	for _, entry := range r.subscribers {
-		ruleIDs := matchRules(entry.rules, message)
+		rules, version := entry.snapshot()
+		ruleIDs := matchRules(rules, message)
 		if len(ruleIDs) == 0 {
 			continue
 		}
 		entry.inFlight.Add(1)
-		targets = append(targets, target{entry: entry, ruleIDs: ruleIDs})
+		targets = append(targets, resolved{entry: entry, ruleIDs: ruleIDs, version: version})
 	}
 	r.mu.RUnlock()
 
@@ -270,19 +469,32 @@ func (r *Router) Publish(message Message) error {
 			Message:        message,
 			SubscriptionID: target.entry.id,
 			RuleIDs:        target.ruleIDs,
+			RuleVersion:    target.version,
 		}
-		select {
-		case target.entry.deliveries <- delivery:
-		default:
+		discarded, dropped := target.entry.deliver(r, delivery)
+		if dropped {
 			r.addRecord(Record{
 				Time:           time.Now(),
 				Kind:           RecordDropped,
 				Code:           "subscriber_buffer_full",
-				Reason:         "subscriber did not accept delivery without blocking",
+				Reason:         "subscriber did not accept delivery without blocking; buffered or handoff messages were retained",
 				MessageID:      message.id,
 				Topic:          message.topic,
 				SubscriptionID: target.entry.id,
 				RuleIDs:        append([]string(nil), target.ruleIDs...),
+				RuleVersion:    target.version,
+			})
+		} else if discarded.Message.id != "" {
+			r.addRecord(Record{
+				Time:           time.Now(),
+				Kind:           RecordDropped,
+				Code:           "subscriber_buffer_evicted",
+				Reason:         "policy keep_newest evicted the oldest buffered message",
+				MessageID:      discarded.Message.id,
+				Topic:          discarded.Message.topic,
+				SubscriptionID: target.entry.id,
+				RuleIDs:        append([]string(nil), discarded.RuleIDs...),
+				RuleVersion:    discarded.RuleVersion,
 			})
 		}
 		target.entry.inFlight.Done()
@@ -290,9 +502,10 @@ func (r *Router) Publish(message Message) error {
 	return nil
 }
 
-// Unsubscribe prevents new deliveries, waits for sends using the final snapshot
-// to finish, then closes the delivery channel. Messages already accepted into
-// the bounded channel remain available and are followed by channel close.
+// Unsubscribe prevents new deliveries and waits for in-flight offers to
+// finish. It then marks the subscription closed: every message already
+// accepted into the bounded buffer (the drain backlog) is still delivered
+// to the consumer in order, followed by channel close.
 func (r *Router) Unsubscribe(id string) error {
 	r.mu.Lock()
 	entry, ok := r.subscribers[id]
@@ -304,7 +517,7 @@ func (r *Router) Unsubscribe(id string) error {
 	r.mu.Unlock()
 
 	entry.inFlight.Wait()
-	close(entry.deliveries)
+	entry.close()
 	return nil
 }
 
@@ -404,4 +617,11 @@ func matchRules(rules []Rule, message Message) []string {
 func copyRecord(record Record) Record {
 	record.RuleIDs = append([]string(nil), record.RuleIDs...)
 	return record
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
