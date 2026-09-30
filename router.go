@@ -68,6 +68,12 @@ type Delivery struct {
 	Message        Message
 	SubscriptionID string
 	RuleIDs        []string
+	// RuleVersion is the subscription rule-set version that matched this
+	// message. The version starts at 1 when Subscribe succeeds and is
+	// incremented by every successful UpdateRules call. It lets a consumer
+	// tell which edition of the rules produced a delivery when publishes
+	// race with rule updates.
+	RuleVersion int
 }
 
 type RecordKind string
@@ -75,6 +81,32 @@ type RecordKind string
 const (
 	RecordRejected RecordKind = "rejected"
 	RecordDropped  RecordKind = "dropped"
+)
+
+// Drop reason codes recorded on RecordDropped entries.
+const (
+	// DropReasonBufferFull is used with OverflowKeepOldest: the buffer was
+	// full so the new message was discarded and the oldest buffered
+	// messages were retained.
+	DropReasonBufferFull = "subscriber_buffer_full"
+	// DropReasonOldestEvicted is used with OverflowKeepNewest: the buffer
+	// was full so the oldest buffered message was evicted to make room
+	// for the new message.
+	DropReasonOldestEvicted = "subscriber_oldest_evicted"
+)
+
+// OverflowPolicy decides what happens to a single subscription whose bounded
+// buffer is full. A slow subscription never blocks Publish or affects any
+// other subscription regardless of the chosen policy.
+type OverflowPolicy string
+
+const (
+	// OverflowKeepOldest keeps the messages already in the buffer and
+	// discards the new one (the default).
+	OverflowKeepOldest OverflowPolicy = "keep_oldest"
+	// OverflowKeepNewest evicts the oldest buffered message so the newest
+	// one can always be delivered.
+	OverflowKeepNewest OverflowPolicy = "keep_newest"
 )
 
 type Record struct {
@@ -86,6 +118,12 @@ type Record struct {
 	Topic          string
 	SubscriptionID string
 	RuleIDs        []string
+	// RuleVersion is the subscription rule-set version in effect for the
+	// operation. For a dropped delivery it identifies the rule edition the
+	// message was matched against; EvictedMessageID identifies which
+	// buffered message was discarded under OverflowKeepNewest.
+	RuleVersion      int
+	EvictedMessageID string
 }
 
 type Option func(*Router) error
@@ -110,6 +148,18 @@ func WithHistorySize(size int) Option {
 	}
 }
 
+// WithOverflowPolicy sets the default overflow policy for subscriptions that
+// do not override it with WithSubscriptionOverflowPolicy.
+func WithOverflowPolicy(policy OverflowPolicy) Option {
+	return func(r *Router) error {
+		if err := validateOverflowPolicy(policy); err != nil {
+			return err
+		}
+		r.overflowPolicy = policy
+		return nil
+	}
+}
+
 type SubscribeOption func(*subscription) error
 
 func WithSubscriptionBufferSize(size int) SubscribeOption {
@@ -122,24 +172,50 @@ func WithSubscriptionBufferSize(size int) SubscribeOption {
 	}
 }
 
+// WithSubscriptionOverflowPolicy chooses between retaining the oldest or the
+// newest messages when this subscription cannot keep up. It does not affect
+// any other subscription.
+func WithSubscriptionOverflowPolicy(policy OverflowPolicy) SubscribeOption {
+	return func(sub *subscription) error {
+		if err := validateOverflowPolicy(policy); err != nil {
+			return err
+		}
+		sub.overflowPolicy = policy
+		return nil
+	}
+}
+
+func validateOverflowPolicy(policy OverflowPolicy) error {
+	switch policy {
+	case OverflowKeepOldest, OverflowKeepNewest:
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown overflow policy %q", ErrInvalidSubscription, policy)
+	}
+}
+
 type Subscription struct {
 	ID         string
 	Deliveries <-chan Delivery
 }
 
 type subscription struct {
-	id         string
-	rules      []Rule
-	bufferSize int
-	deliveries chan Delivery
-	inFlight   sync.WaitGroup
+	id             string
+	rules          []Rule
+	ruleVersion    int
+	bufferSize     int
+	overflowPolicy OverflowPolicy
+	deliveries     chan Delivery
+	sendMu         sync.Mutex
+	inFlight       sync.WaitGroup
 }
 
 type Router struct {
-	mu          sync.RWMutex
-	bufferSize  int
-	historySize int
-	subscribers map[string]*subscription
+	mu             sync.RWMutex
+	bufferSize     int
+	historySize    int
+	overflowPolicy OverflowPolicy
+	subscribers    map[string]*subscription
 
 	auditMu   sync.Mutex
 	history   []Record
@@ -148,9 +224,10 @@ type Router struct {
 
 func NewRouter(options ...Option) (*Router, error) {
 	r := &Router{
-		bufferSize:  defaultBufferSize,
-		historySize: defaultHistorySize,
-		subscribers: make(map[string]*subscription),
+		bufferSize:     defaultBufferSize,
+		historySize:    defaultHistorySize,
+		overflowPolicy: OverflowKeepOldest,
+		subscribers:    make(map[string]*subscription),
 	}
 	for _, option := range options {
 		if err := option(r); err != nil {
@@ -170,9 +247,11 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 	}
 
 	entry := &subscription{
-		id:         id,
-		rules:      prepared,
-		bufferSize: r.bufferSize,
+		id:             id,
+		rules:          prepared,
+		ruleVersion:    1,
+		bufferSize:     r.bufferSize,
+		overflowPolicy: r.overflowPolicy,
 	}
 	for _, option := range options {
 		if err := option(entry); err != nil {
@@ -217,8 +296,8 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 	r.mu.Lock()
 	entry, ok := r.subscribers[subscriptionID]
 	if !ok {
-		r.mu.Unlock()
 		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, subscriptionID)
+		r.mu.Unlock()
 		r.addRecord(Record{
 			Kind:           RecordRejected,
 			Code:           "subscription_gone",
@@ -228,6 +307,7 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 		return err
 	}
 	entry.rules = prepared
+	entry.ruleVersion++
 	r.mu.Unlock()
 	return nil
 }
@@ -235,6 +315,11 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 // Publish dispatches a message using one atomic subscription/rule snapshot.
 // A full subscriber buffer causes only that delivery to be dropped; other
 // subscribers are unaffected and Publish never waits for a slow consumer.
+//
+// Each matching subscription is evaluated against one immutable snapshot of
+// its rule list, and every produced Delivery is stamped with that snapshot's
+// RuleVersion. A message that races with UpdateRules therefore matches either
+// the old edition or the new edition entirely, never a mixture of both.
 func (r *Router) Publish(message Message) error {
 	if message.id == "" || message.topic == "" {
 		err := fmt.Errorf("%w: use NewMessage to construct messages", ErrInvalidMessage)
@@ -251,6 +336,7 @@ func (r *Router) Publish(message Message) error {
 	type target struct {
 		entry   *subscription
 		ruleIDs []string
+		version int
 	}
 
 	r.mu.RLock()
@@ -261,7 +347,7 @@ func (r *Router) Publish(message Message) error {
 			continue
 		}
 		entry.inFlight.Add(1)
-		targets = append(targets, target{entry: entry, ruleIDs: ruleIDs})
+		targets = append(targets, target{entry: entry, ruleIDs: ruleIDs, version: entry.ruleVersion})
 	}
 	r.mu.RUnlock()
 
@@ -270,21 +356,9 @@ func (r *Router) Publish(message Message) error {
 			Message:        message,
 			SubscriptionID: target.entry.id,
 			RuleIDs:        target.ruleIDs,
+			RuleVersion:    target.version,
 		}
-		select {
-		case target.entry.deliveries <- delivery:
-		default:
-			r.addRecord(Record{
-				Time:           time.Now(),
-				Kind:           RecordDropped,
-				Code:           "subscriber_buffer_full",
-				Reason:         "subscriber did not accept delivery without blocking",
-				MessageID:      message.id,
-				Topic:          message.topic,
-				SubscriptionID: target.entry.id,
-				RuleIDs:        append([]string(nil), target.ruleIDs...),
-			})
-		}
+		target.entry.dispatch(delivery, r)
 		target.entry.inFlight.Done()
 	}
 	return nil
@@ -293,6 +367,63 @@ func (r *Router) Publish(message Message) error {
 // Unsubscribe prevents new deliveries, waits for sends using the final snapshot
 // to finish, then closes the delivery channel. Messages already accepted into
 // the bounded channel remain available and are followed by channel close.
+//
+// dispatch serializes sends for one subscription so the receive-evict-resend
+// sequence of OverflowKeepNewest cannot interleave with concurrent Publishes.
+// It never waits for the subscriber: when the bounded buffer is full either
+// the new message or the oldest buffered message is discarded and a
+// RecordDropped audit entry explains which one and why.
+func (sub *subscription) dispatch(delivery Delivery, r *Router) {
+	sub.sendMu.Lock()
+	defer sub.sendMu.Unlock()
+
+	select {
+	case sub.deliveries <- delivery:
+		return
+	default:
+	}
+
+	if sub.overflowPolicy == OverflowKeepNewest {
+		select {
+		case evicted, ok := <-sub.deliveries:
+			if !ok {
+				return
+			}
+			select {
+			case sub.deliveries <- delivery:
+				r.addRecord(Record{
+					Kind:             RecordDropped,
+					Code:             DropReasonOldestEvicted,
+					Reason:           "subscriber buffer full; oldest buffered message evicted to retain the newest",
+					MessageID:        delivery.Message.id,
+					Topic:            delivery.Message.topic,
+					SubscriptionID:   sub.id,
+					RuleIDs:          append([]string(nil), delivery.RuleIDs...),
+					RuleVersion:      delivery.RuleVersion,
+					EvictedMessageID: evicted.Message.id,
+				})
+				return
+			default:
+				// Another goroutine cannot refill the buffer while sendMu is
+				// held; fall through to dropping the new message anyway.
+			}
+		default:
+			// Zero-capacity buffer with no waiting receiver: keep nothing new.
+		}
+	}
+
+	r.addRecord(Record{
+		Kind:           RecordDropped,
+		Code:           DropReasonBufferFull,
+		Reason:         "subscriber did not accept delivery without blocking; buffered messages retained",
+		MessageID:      delivery.Message.id,
+		Topic:          delivery.Message.topic,
+		SubscriptionID: sub.id,
+		RuleIDs:        append([]string(nil), delivery.RuleIDs...),
+		RuleVersion:    delivery.RuleVersion,
+	})
+}
+
 func (r *Router) Unsubscribe(id string) error {
 	r.mu.Lock()
 	entry, ok := r.subscribers[id]
