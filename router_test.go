@@ -87,8 +87,12 @@ func TestSlowSubscriberDoesNotBlockOthersAndRecordsDrop(t *testing.T) {
 		}
 	}
 
-	if got := len(slow.Deliveries); got != 1 {
-		t.Fatalf("slow buffered deliveries = %d, want 1", got)
+	if err := router.Unsubscribe("slow"); err != nil {
+		t.Fatal(err)
+	}
+	slowGot := drain(slow)
+	if len(slowGot) != 1 || slowGot[0].Message.ID() != "a" {
+		t.Fatalf("slow deliveries = %#v, want only oldest message a", slowGot)
 	}
 	if err := router.Unsubscribe("fast"); err != nil {
 		t.Fatal(err)

@@ -49,10 +49,19 @@ go run ./examples/demo
 
 每个订阅者有独立的有界缓冲（默认 16，可用 `WithSubscriptionBufferSize(n)` 覆盖；`WithBufferSize` 设置路由器默认值）。缓冲满时只影响该订阅者，其他订阅者照常接收，`Publish` 也绝不等待慢消费者。通过 `WithOverflowPolicy` 选择满时行为：
 
+容量为 0 时没有可积压空间：消费者正阻塞等待则立即交接，否则本条立即按 `subscriber_buffer_full` 丢弃；`Publish` 仍然不等待。
+
 - `KeepOldest`（默认）：保留缓冲中的旧消息，**丢弃新来的消息**，记录 `Code = "subscriber_buffer_full"`。
 - `KeepNewest`：淘汰缓冲中最旧的消息为新消息腾位，始终保留最新的一批，被淘汰消息记录 `Code = "subscriber_buffer_evicted"`。
 
-`KeepNewest` 下正在向消费者交接（handoff）的那一条消息不可中途回收；它是系统中仍存在的最旧消息。交接槽之外的缓冲满时即淘汰其中最旧者，因此消费者看到的总是“最新的 N 条”，顺序保持先进先出。
+容量按“消费者尚未接收”的全部消息计算，包括 pump 正在向 channel 交接、但消费者尚未真正接收的那一条。进入交接位置不会把消息移出保留策略：暂停接收时，`KeepNewest` 仍会淘汰它，消费者最终看到且只看到最新 N 条，顺序保持先进先出。交接与消费者接收并发时，只有消费者已经接收才不可撤回；否则淘汰生效。
+
+可在订阅运行中调用 `UpdateOverflowPolicy(id, policy)` 原子切换策略：
+
+- 成功返回后，之后进入该订阅者的消息按新策略处理；已经完成接纳或丢弃的消息不追溯。
+- 切换本身不清空积压：现有消息保持原 FIFO 位置。切到 `KeepOldest` 后，满缓冲中的新消息被丢弃；切到 `KeepNewest` 后，下一条新消息到达时淘汰当前最旧的未接收消息。
+- 初始策略版本为 1；只有实际切换到不同策略才递增。切换为相同策略是成功 no-op，版本不变；非法策略或订阅已取消返回错误。
+- `Delivery.PolicyVersion` 与 `Record.PolicyVersion` 标明每条交付、丢弃、淘汰采用的策略版本。
 
 两种策略只作用于选择它的订阅者，快速订阅者永远不受影响。
 
@@ -73,7 +82,8 @@ go run ./examples/demo
 - `Kind`：`rejected`（非法消息/规则/订阅）或 `dropped`（因慢消费者丢弃或淘汰）；
 - `Code` / `Reason`：机器可读原因码与文字说明，例如 `subscriber_buffer_full`、`subscriber_buffer_evicted`；
 - `MessageID`、`Topic`、`SubscriptionID`：定位具体消息与订阅者；
-- `RuleIDs`、`RuleVersion`：该消息当时命中的规则与规则版本，丢弃与淘汰记录同样携带，方便在并发换规则后还原“它本来会按哪版规则交给谁”。
+- `RuleIDs`、`RuleVersion`：该消息当时命中的规则与规则版本，丢弃与淘汰记录同样携带，方便在并发换规则后还原“它本来会按哪版规则交给谁”；
+- `PolicyVersion`：该消息被接纳、丢弃或淘汰时订阅者采用的溢出策略版本。
 
 ## API 概览
 
@@ -83,6 +93,7 @@ go run ./examples/demo
 | `NewRouter(opts...)` | 创建路由器（`WithBufferSize`、`WithHistorySize`） |
 | `Subscribe(id, rules, opts...)` | 订阅，规则版本从 1 开始；返回消费 channel |
 | `UpdateRules(id, rules)` | 原子替换规则集，成功后版本加 1 |
+| `UpdateOverflowPolicy(id, policy)` | 运行中原子切换该订阅者的溢出策略，实际改变后策略版本加 1 |
 | `Publish(msg)` | 非阻塞分发；慢订阅者按溢出策略丢弃并记录 |
 | `Unsubscribe(id)` | 停止新投递，排空积压后关闭 channel |
 | `Records()` | 读取拒绝/丢弃/淘汰审计记录 |

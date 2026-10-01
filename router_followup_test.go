@@ -1,6 +1,8 @@
 package router
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -109,27 +111,22 @@ func TestKeepNewestEvictsOldest(t *testing.T) {
 	}
 
 	got := drain(slow)
-	if len(got) < 3 || len(got) > 4 {
-		t.Fatalf("slow deliveries = %d, want 3 or 4: %#v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("slow deliveries = %d, want exactly 3: %#v", len(got), got)
 	}
-	seen := make(map[string]bool, len(got))
 	for _, delivery := range got {
 		if delivery.RuleVersion != 1 {
 			t.Fatalf("delivery %q version = %d, want 1", delivery.Message.ID(), delivery.RuleVersion)
 		}
-		seen[delivery.Message.ID()] = true
 	}
-	// The three newest messages are always retained, in order, possibly
-	// preceded by m1 which was already pinned in the pump's handoff slot.
-	wantTail := []string{"m3", "m4", "m5"}
-	tail := got[len(got)-3:]
-	for index, id := range wantTail {
-		if tail[index].Message.ID() != id {
-			t.Fatalf("delivery tail %d = %q, want %q; all: %#v", index, tail[index].Message.ID(), id, got)
+	// The consumer never read anything, so every message -- including the one
+	// parked in the pump's handoff -- participates in KeepNewest eviction:
+	// the consumer sees exactly the newest N messages, in FIFO order.
+	want := []string{"m3", "m4", "m5"}
+	for index, id := range want {
+		if got[index].Message.ID() != id {
+			t.Fatalf("delivery %d = %q, want %q; all: %#v", index, got[index].Message.ID(), id, got)
 		}
-	}
-	if len(got) == 4 && !seen["m1"] {
-		t.Fatalf("fourth retained delivery must be the pinned m1: %#v", got)
 	}
 	if fast := <-fastDone; len(fast) != 5 {
 		t.Fatalf("fast deliveries = %d, want 5", len(fast))
@@ -150,8 +147,8 @@ func TestKeepNewestEvictsOldest(t *testing.T) {
 			rejects++
 		}
 	}
-	if evictions != 5-len(got) {
-		t.Fatalf("evictions = %d, want %d for %d deliveries", evictions, 5-len(got), len(got))
+	if evictions != 2 {
+		t.Fatalf("evictions = %d, want 2", evictions)
 	}
 	if rejects != 0 {
 		t.Fatalf("unexpected rejects = %d", rejects)
@@ -272,5 +269,291 @@ func TestConcurrentUpdatesVersionEveryDelivery(t *testing.T) {
 		if len(delivery.RuleIDs) == 0 {
 			t.Fatalf("delivery without matched rules: %#v", delivery)
 		}
+	}
+}
+
+func TestUpdateOverflowPolicyAppliesToFutureOffersAndVersionsBacklog(t *testing.T) {
+	router, err := NewRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow, err := router.Subscribe("slow", []Rule{{ID: "topic", Topic: "t"}},
+		WithSubscriptionBufferSize(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast, err := router.Subscribe("fast", []Rule{{ID: "topic", Topic: "t"}},
+		WithSubscriptionBufferSize(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastDone := make(chan []Delivery, 1)
+	go func() { fastDone <- drain(fast) }()
+
+	publish := func(id string) {
+		t.Helper()
+		if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"m1", "m2", "m3"} {
+		publish(id)
+	}
+	if err := router.UpdateOverflowPolicy("slow", KeepNewest); err != nil {
+		t.Fatal(err)
+	}
+	publish("m4")
+	if err := router.UpdateOverflowPolicy("slow", KeepOldest); err != nil {
+		t.Fatal(err)
+	}
+	publish("m5")
+	if err := router.UpdateOverflowPolicy("slow", KeepOldest); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Unsubscribe("slow"); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Unsubscribe("fast"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := drain(slow)
+	wantIDs := []string{"m2", "m3", "m4"}
+	wantVersions := []int{1, 1, 2}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("slow deliveries = %d, want %d: %#v", len(got), len(wantIDs), got)
+	}
+	for index := range wantIDs {
+		if got[index].Message.ID() != wantIDs[index] || got[index].PolicyVersion != wantVersions[index] {
+			t.Fatalf("delivery %d = %#v, want %s at policy version %d", index, got[index], wantIDs[index], wantVersions[index])
+		}
+	}
+	if fast := <-fastDone; len(fast) != 5 {
+		t.Fatalf("fast deliveries = %d, want all 5", len(fast))
+	}
+
+	var evictions, fullDrops int
+	for _, record := range router.Records() {
+		switch record.Code {
+		case "subscriber_buffer_evicted":
+			evictions++
+			if record.MessageID != "m1" || record.PolicyVersion != 1 || record.SubscriptionID != "slow" {
+				t.Fatalf("unexpected eviction: %#v", record)
+			}
+		case "subscriber_buffer_full":
+			fullDrops++
+			if record.MessageID != "m5" || record.PolicyVersion != 3 || record.SubscriptionID != "slow" {
+				t.Fatalf("unexpected full drop: %#v", record)
+			}
+		}
+	}
+	if evictions != 1 || fullDrops != 1 {
+		t.Fatalf("evictions = %d, full drops = %d, want 1 each", evictions, fullDrops)
+	}
+}
+
+func TestUpdateOverflowPolicyFromNewestToOldestKeepsCurrentBacklog(t *testing.T) {
+	router, err := NewRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}},
+		WithSubscriptionBufferSize(3), WithOverflowPolicy(KeepNewest))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for index := 1; index <= 5; index++ {
+		if err := router.Publish(mustMessage(t, fmt.Sprintf("m%d", index), "t", nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := router.UpdateOverflowPolicy("sub", KeepOldest); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Publish(mustMessage(t, "m6", "t", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Unsubscribe("sub"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := drain(sub)
+	if len(got) != 3 {
+		t.Fatalf("deliveries = %d, want 3: %#v", len(got), got)
+	}
+	for index, id := range []string{"m3", "m4", "m5"} {
+		if got[index].Message.ID() != id || got[index].PolicyVersion != 1 {
+			t.Fatalf("delivery %d = %#v, want %s retained by policy version 1", index, got[index], id)
+		}
+	}
+	records := router.Records()
+	if len(records) != 3 {
+		t.Fatalf("records = %d, want two evictions and one full drop: %#v", len(records), records)
+	}
+	var m6 *Record
+	for index := range records {
+		if records[index].MessageID == "m6" {
+			m6 = &records[index]
+		}
+	}
+	if m6 == nil || m6.Code != "subscriber_buffer_full" || m6.PolicyVersion != 2 {
+		t.Fatalf("m6 record = %#v, want policy version 2 full drop", m6)
+	}
+}
+
+func TestZeroCapacityDropsEveryPausedDelivery(t *testing.T) {
+	for _, policy := range []OverflowPolicy{KeepOldest, KeepNewest} {
+		t.Run(string(policy), func(t *testing.T) {
+			router, err := NewRouter()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sub, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}},
+				WithSubscriptionBufferSize(0), WithOverflowPolicy(policy))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := router.Publish(mustMessage(t, "m1", "t", nil)); err != nil {
+				t.Fatal(err)
+			}
+			if err := router.Unsubscribe("sub"); err != nil {
+				t.Fatal(err)
+			}
+			if got := drain(sub); len(got) != 0 {
+				t.Fatalf("deliveries = %#v, want none for zero capacity", got)
+			}
+			records := router.Records()
+			if len(records) != 1 || records[0].Code != "subscriber_buffer_full" || records[0].PolicyVersion != 1 {
+				t.Fatalf("records = %#v, want one version-1 full drop", records)
+			}
+		})
+	}
+}
+
+func TestZeroCapacityDeliversWhenReceiverIsReady(t *testing.T) {
+	router, err := NewRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}},
+		WithSubscriptionBufferSize(0), WithOverflowPolicy(KeepNewest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan Delivery, 1)
+	go func() {
+		received <- <-sub.Deliveries
+	}()
+
+	var delivered bool
+	for attempt := 0; attempt < 1000 && !delivered; attempt++ {
+		if err := router.Publish(mustMessage(t, "m1", "t", nil)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case delivery := <-received:
+			if delivery.Message.ID() != "m1" {
+				t.Fatalf("delivery = %#v, want m1", delivery)
+			}
+			delivered = true
+		default:
+		}
+	}
+	if !delivered {
+		t.Fatal("zero-capacity subscription never hand-delivered to a ready receiver")
+	}
+	if err := router.Unsubscribe("sub"); err != nil {
+		t.Fatal(err)
+	}
+	drain(sub)
+}
+
+func TestUpdateOverflowPolicyRejectsInvalidPolicyAndGoneSubscription(t *testing.T) {
+	router, err := NewRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := router.UpdateOverflowPolicy("sub", "keep-middle"); err == nil {
+		t.Fatal("invalid policy update unexpectedly succeeded")
+	}
+	if err := router.Unsubscribe("sub"); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.UpdateOverflowPolicy("sub", KeepNewest); !errors.Is(err, ErrSubscriptionGone) {
+		t.Fatalf("gone subscription policy update error = %v, want ErrSubscriptionGone", err)
+	}
+	drain(sub)
+}
+
+func TestConcurrentPausedPublishersKeepExactlyOneBoundedWindow(t *testing.T) {
+	for _, policy := range []OverflowPolicy{KeepOldest, KeepNewest} {
+		t.Run(string(policy), func(t *testing.T) {
+			router, err := NewRouter(WithHistorySize(1024))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sub, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}},
+				WithSubscriptionBufferSize(3), WithOverflowPolicy(policy))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			const workers = 3
+			const perWorker = 20
+			var publishers sync.WaitGroup
+			publishers.Add(workers)
+			for worker := 0; worker < workers; worker++ {
+				go func(worker int) {
+					defer publishers.Done()
+					for index := 0; index < perWorker; index++ {
+						id := fmt.Sprintf("m%d-%d", index, worker)
+						if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
+							t.Errorf("Publish(%s): %v", id, err)
+							return
+						}
+					}
+				}(worker)
+			}
+			publishers.Wait()
+			if err := router.Unsubscribe("sub"); err != nil {
+				t.Fatal(err)
+			}
+
+			got := drain(sub)
+			if len(got) != 3 {
+				t.Fatalf("deliveries = %d, want bounded window of 3: %#v", len(got), got)
+			}
+			lastByWorker := make(map[int]int)
+			seen := make(map[string]bool)
+			for _, delivery := range got {
+				var sequence, worker int
+				if _, err := fmt.Sscanf(delivery.Message.ID(), "m%d-%d", &sequence, &worker); err != nil {
+					t.Fatalf("delivery id %q: %v", delivery.Message.ID(), err)
+				}
+				if seen[delivery.Message.ID()] {
+					t.Fatalf("duplicate delivery %q: %#v", delivery.Message.ID(), got)
+				}
+				seen[delivery.Message.ID()] = true
+				if previous, ok := lastByWorker[worker]; ok && sequence <= previous {
+					t.Fatalf("worker %d deliveries are not FIFO: %#v", worker, got)
+				}
+				lastByWorker[worker] = sequence
+			}
+			dropped := 0
+			for _, record := range router.Records() {
+				if record.Kind != RecordDropped || record.RuleVersion != 1 || record.PolicyVersion != 1 {
+					t.Fatalf("unexpected audit record: %#v", record)
+				}
+				dropped++
+			}
+			if dropped != workers*perWorker-3 {
+				t.Fatalf("dropped = %d, want %d", dropped, workers*perWorker-3)
+			}
+		})
 	}
 }
