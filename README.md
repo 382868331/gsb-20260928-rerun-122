@@ -52,9 +52,18 @@ go run ./examples/demo
 - `KeepOldest`（默认）：保留缓冲中的旧消息，**丢弃新来的消息**，记录 `Code = "subscriber_buffer_full"`。
 - `KeepNewest`：淘汰缓冲中最旧的消息为新消息腾位，始终保留最新的一批，被淘汰消息记录 `Code = "subscriber_buffer_evicted"`。
 
-`KeepNewest` 下正在向消费者交接（handoff）的那一条消息不可中途回收；它是系统中仍存在的最旧消息。交接槽之外的缓冲满时即淘汰其中最旧者，因此消费者看到的总是“最新的 N 条”，顺序保持先进先出。
+保留策略统一作用于**所有尚未被消费者接收的消息**——包括正在交接（handoff）中的那一条。`KeepNewest` 下缓冲满时淘汰最旧的未接收消息（交接中的消息若最旧也会被放弃），因此消费者看到的恰好是“最新的 N 条”，顺序保持先进先出。若淘汰与消费者的接收恰好并发竞争，以实际结果为准：已被消费者接收的消息不会再被记为淘汰。
 
 两种策略只作用于选择它的订阅者，快速订阅者永远不受影响。
+
+## 运行中切换溢出策略
+
+`SetOverflowPolicy(id, policy)` 在订阅运行期间切换溢出策略：
+
+- 新策略对调用返回之后的每次投递立即生效；正在进行的并发投递可能仍按旧策略执行。
+- 切换本身**不改写积压**：已接收进缓冲（含交接中）的消息全部保留并按序交付。切到 `KeepNewest` 后，新的溢出会淘汰最旧的未接收消息——那可能正是切换前积压里的消息；切到 `KeepOldest` 后，缓冲满时新到消息被丢弃。
+- 切换只影响目标订阅者；取消订阅后再调用返回 `ErrSubscriptionGone`，取消后迟到的发送也不会再交付。
+- 非法策略或空订阅 ID 会被拒绝并记入审计（`invalid_overflow_policy` / `invalid_subscription`），原策略保持不变。
 
 ## 取消与排空语义
 
@@ -83,6 +92,7 @@ go run ./examples/demo
 | `NewRouter(opts...)` | 创建路由器（`WithBufferSize`、`WithHistorySize`） |
 | `Subscribe(id, rules, opts...)` | 订阅，规则版本从 1 开始；返回消费 channel |
 | `UpdateRules(id, rules)` | 原子替换规则集，成功后版本加 1 |
+| `SetOverflowPolicy(id, policy)` | 运行中切换溢出策略；积压保留，新策略对后续投递生效 |
 | `Publish(msg)` | 非阻塞分发；慢订阅者按溢出策略丢弃并记录 |
 | `Unsubscribe(id)` | 停止新投递，排空积压后关闭 channel |
 | `Records()` | 读取拒绝/丢弃/淘汰审计记录 |

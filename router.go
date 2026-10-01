@@ -169,16 +169,12 @@ type Subscription struct {
 type subscription struct {
 	id         string
 	bufferSize int
-	overflow   OverflowPolicy
 	deliveries chan Delivery
 
-	// direct subscriptions (KeepOldest) publish straight into the buffered
-	// channel; pump/ring fields stay unused.
-	direct bool
-
-	mu      sync.Mutex
-	rules   []Rule
-	version int
+	mu       sync.Mutex
+	rules    []Rule
+	version  int
+	overflow OverflowPolicy
 
 	// queued is the bounded ring of accepted-but-not-yet-sent deliveries.
 	queued []Delivery
@@ -187,9 +183,18 @@ type subscription struct {
 	closed bool
 
 	// pending holds the oldest queued delivery while the pump is waiting
-	// for the consumer to accept it. Keeping it out of the ring lets the
-	// pump continue accepting newer messages (and apply KeepNewest).
+	// for the consumer to accept it. It is still an unreceived message:
+	// KeepNewest may evict it, in which case gen advances and the pump
+	// reconciles the outcome of its in-flight send against the eviction.
 	pending *Delivery
+	// gen identifies the current pending assignment; it changes whenever
+	// pending is set, cleared, or evicted.
+	gen int
+	// reconciled holds a pending delivery that offer evicted while the
+	// pump might concurrently complete its send. The pump either records
+	// the eviction (the send lost the race) or drops it (the consumer
+	// actually received the message, so nothing was evicted).
+	reconciled *Delivery
 
 	notify   chan struct{}
 	inFlight sync.WaitGroup
@@ -240,22 +245,12 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 		}
 	}
 
-	var ch chan Delivery
-	if entry.overflow == KeepNewest {
-		ch = make(chan Delivery)
-	} else {
-		ch = make(chan Delivery, entry.bufferSize)
-	}
+	ch := make(chan Delivery)
 	entry.deliveries = ch
 	entry.rules = prepared
 	entry.version = 1
-	if entry.overflow == KeepNewest {
-		entry.direct = false
-		entry.queued = make([]Delivery, maxInt(entry.bufferSize, 1))
-		entry.notify = make(chan struct{}, 1)
-	} else {
-		entry.direct = true
-	}
+	entry.queued = make([]Delivery, maxInt(entry.bufferSize, 1))
+	entry.notify = make(chan struct{}, 1)
 
 	r.mu.Lock()
 	if _, exists := r.subscribers[id]; exists {
@@ -265,9 +260,7 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 	r.subscribers[id] = entry
 	r.mu.Unlock()
 
-	if entry.overflow == KeepNewest {
-		go entry.pump(r)
-	}
+	go entry.pump(r)
 
 	return Subscription{ID: id, Deliveries: ch}, nil
 }
@@ -282,10 +275,31 @@ func (s *subscription) snapshot() ([]Rule, int) {
 
 // pump forwards accepted deliveries to the consumer in order. A delivery is
 // held in pending until the consumer accepts it, so a slow consumer cannot
-// block Publish and never affects how newer messages enter the ring.
+// block Publish and never affects how newer messages enter the ring. The
+// pending delivery still counts against the retention policy: if KeepNewest
+// evicts it mid-handoff, the pump abandons that send and moves on. When the
+// consumer send and an eviction race, the actual outcome decides the audit
+// record: a message the consumer received is never reported as evicted.
 func (s *subscription) pump(router *Router) {
 	for {
 		s.mu.Lock()
+		if s.reconciled != nil {
+			evicted := *s.reconciled
+			s.reconciled = nil
+			s.mu.Unlock()
+			router.addRecord(Record{
+				Time:           time.Now(),
+				Kind:           RecordDropped,
+				Code:           "subscriber_buffer_evicted",
+				Reason:         "policy keep_newest evicted the oldest buffered message",
+				MessageID:      evicted.Message.id,
+				Topic:          evicted.Message.topic,
+				SubscriptionID: evicted.SubscriptionID,
+				RuleIDs:        append([]string(nil), evicted.RuleIDs...),
+				RuleVersion:    evicted.RuleVersion,
+			})
+			continue
+		}
 		if s.pending == nil {
 			if s.count > 0 {
 				delivery := s.queued[s.head]
@@ -293,6 +307,7 @@ func (s *subscription) pump(router *Router) {
 				s.head = (s.head + 1) % len(s.queued)
 				s.count--
 				s.pending = &delivery
+				s.gen++
 			} else if s.closed {
 				s.mu.Unlock()
 				close(s.deliveries)
@@ -300,19 +315,33 @@ func (s *subscription) pump(router *Router) {
 			}
 		}
 		delivery := s.pending
+		gen := s.gen
 		notify := s.notify
 		s.mu.Unlock()
 
-		if delivery != nil {
-			s.deliveries <- *delivery
-			s.mu.Lock()
-			s.pending = nil
-			s.mu.Unlock()
+		if delivery == nil {
+			<-notify
 			continue
 		}
 
-		_ = notify
-		<-notify
+		select {
+		case s.deliveries <- *delivery:
+			s.mu.Lock()
+			if s.gen == gen {
+				s.pending = nil
+				s.gen++
+			} else {
+				// The consumer received a delivery that offer had
+				// already evicted from pending. Received messages are
+				// no longer subject to the retention policy, so the
+				// eviction simply never happened.
+				s.reconciled = nil
+			}
+			s.mu.Unlock()
+		case <-notify:
+			// State changed (arrival, eviction, or close); re-read
+			// under the lock before retrying the handoff.
+		}
 	}
 }
 
@@ -358,53 +387,109 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 	return nil
 }
 
-// offer accepts a matched delivery into the bounded buffer. The return value
-// is the delivery that had to be discarded (if any) along with a stable
-// copy; offers never block on the consumer.
-func (s *subscription) deliver(router *Router, delivery Delivery) (Delivery, bool) {
-	if s.direct {
-		select {
-		case s.deliveries <- delivery:
-			return Delivery{}, false
-		default:
-			return delivery, true
-		}
+// SetOverflowPolicy switches a running subscription's overflow policy. The
+// new policy applies to every delivery offered after the call returns;
+// offers already in flight may still observe the previous policy. The
+// backlog is never rewritten by the switch itself: every message already
+// accepted (buffered or in handoff) is retained and delivered in order.
+// Under KeepNewest, later overflow evicts the oldest unreceived message,
+// which may well be part of that pre-switch backlog; under KeepOldest,
+// later arrivals are dropped while the buffer stays full. The choice only
+// ever affects this subscription.
+func (r *Router) SetOverflowPolicy(subscriptionID string, policy OverflowPolicy) error {
+	if subscriptionID == "" {
+		err := fmt.Errorf("%w: subscription id is required", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "invalid_subscription",
+			Reason: err.Error(),
+		})
+		return err
 	}
-	return s.offer(delivery)
+	if policy != KeepOldest && policy != KeepNewest {
+		err := fmt.Errorf("%w: unknown overflow policy %q", ErrInvalidSubscription, policy)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "invalid_overflow_policy",
+			Reason:         err.Error(),
+			SubscriptionID: subscriptionID,
+		})
+		return err
+	}
+
+	r.mu.RLock()
+	entry, ok := r.subscribers[subscriptionID]
+	r.mu.RUnlock()
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, subscriptionID)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_gone",
+			Reason:         err.Error(),
+			SubscriptionID: subscriptionID,
+		})
+		return err
+	}
+	entry.mu.Lock()
+	entry.overflow = policy
+	entry.mu.Unlock()
+	return nil
 }
 
-func (s *subscription) offer(delivery Delivery) (Delivery, bool) {
+// offer accepts a matched delivery into the bounded buffer without ever
+// blocking on the consumer. It returns the delivery that had to be
+// discarded together with the audit code for it; an empty code means the
+// delivery was accepted with no loss.
+//
+// The retention policy covers every message the consumer has not received
+// yet: the ring plus the pump's in-flight handoff (pending) together hold
+// at most bufferSize messages. KeepOldest drops the incoming delivery when
+// full; KeepNewest evicts the oldest unreceived delivery, which is the
+// pending handoff when one exists.
+func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return delivery, true
+		return delivery, "subscriber_buffer_full"
 	}
 
-	// The ring holds up to bufferSize buffered messages; the pump's
-	// active handoff (pending) is one additional non-reclaimable slot.
-	// KeepNewest always makes room for the newest message by evicting the
-	// oldest buffered message when the ring is full. The pinned handoff
-	// message, if any, is the oldest message still in the system and is
-	// never reclaimed mid-send.
-	if s.count < s.bufferSize {
+	occupied := s.count
+	if s.pending != nil {
+		occupied++
+	}
+	if occupied < s.bufferSize {
 		capacity := len(s.queued)
 		s.queued[(s.head+s.count)%capacity] = delivery
 		s.count++
-		if s.pending == nil && s.count == 1 {
-			s.signal()
-		}
-		return Delivery{}, false
+		s.signal()
+		return Delivery{}, ""
 	}
 
-	if s.bufferSize == 0 {
-		return delivery, true
+	if s.overflow == KeepNewest && s.bufferSize > 0 {
+		if s.pending != nil {
+			// The oldest unreceived message is the pump's in-flight
+			// handoff. Evict it and wake the pump; the pump records
+			// the eviction once it confirms its send did not complete.
+			evicted := *s.pending
+			s.pending = nil
+			s.gen++
+			s.reconciled = &evicted
+			capacity := len(s.queued)
+			s.queued[(s.head+s.count)%capacity] = delivery
+			s.count++
+			s.signal()
+			return Delivery{}, ""
+		}
+		capacity := len(s.queued)
+		evicted := s.queued[s.head]
+		s.queued[s.head] = Delivery{}
+		s.head = (s.head + 1) % capacity
+		s.queued[(s.head+s.count-1)%capacity] = delivery
+		s.signal()
+		return evicted, "subscriber_buffer_evicted"
 	}
-	capacity := len(s.queued)
-	evicted := s.queued[s.head]
-	s.queued[s.head] = Delivery{}
-	s.head = (s.head + 1) % capacity
-	s.queued[(s.head+s.count-1)%capacity] = delivery
-	return evicted, false
+
+	return delivery, "subscriber_buffer_full"
 }
 
 // close marks the subscription closed; the pump finishes sending every
@@ -412,15 +497,8 @@ func (s *subscription) offer(delivery Delivery) (Delivery, bool) {
 func (s *subscription) close() {
 	s.mu.Lock()
 	s.closed = true
-	direct := s.direct
-	ch := s.deliveries
-	if !direct {
-		s.signal()
-	}
+	s.signal()
 	s.mu.Unlock()
-	if direct {
-		close(ch)
-	}
 }
 
 func (s *subscription) signal() {
@@ -471,8 +549,10 @@ func (r *Router) Publish(message Message) error {
 			RuleIDs:        target.ruleIDs,
 			RuleVersion:    target.version,
 		}
-		discarded, dropped := target.entry.deliver(r, delivery)
-		if dropped {
+		discarded, code := target.entry.offer(delivery)
+		switch code {
+		case "":
+		case "subscriber_buffer_full":
 			r.addRecord(Record{
 				Time:           time.Now(),
 				Kind:           RecordDropped,
@@ -484,7 +564,7 @@ func (r *Router) Publish(message Message) error {
 				RuleIDs:        append([]string(nil), target.ruleIDs...),
 				RuleVersion:    target.version,
 			})
-		} else if discarded.Message.id != "" {
+		case "subscriber_buffer_evicted":
 			r.addRecord(Record{
 				Time:           time.Now(),
 				Kind:           RecordDropped,

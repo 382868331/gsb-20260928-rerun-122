@@ -106,7 +106,28 @@ func main() {
 	// is fully drained before the channel closes.
 	_ = r.Unsubscribe("slow-new")
 	got = consume("slow-new", slowNew)
-	fmt.Printf("  slow retained %v (newest messages kept; tail is always i, j)\n\n", ids(got))
+	fmt.Printf("  slow retained %v (exactly the newest 2: i, j)\n\n", ids(got))
+
+	// 3b) Switch the overflow policy while the subscription is running. The
+	//     backlog is kept; only new deliveries observe the new policy.
+	fmt.Println("== runtime overflow policy switch ==")
+	switcher, err := r.Subscribe("switcher", []router.Rule{{ID: "t", Topic: "sw"}},
+		router.WithSubscriptionBufferSize(2))
+	if err != nil {
+		panic(err)
+	}
+	for _, id := range []string{"s1", "s2", "s3"} { // KeepOldest: s3 dropped
+		_ = r.Publish(mustMsg(id, "sw", nil))
+	}
+	if err := r.SetOverflowPolicy("switcher", router.KeepNewest); err != nil {
+		panic(err)
+	}
+	for _, id := range []string{"s4", "s5"} { // KeepNewest: evicts s1, s2
+		_ = r.Publish(mustMsg(id, "sw", nil))
+	}
+	_ = r.Unsubscribe("switcher")
+	got = consume("switcher", switcher)
+	fmt.Printf("  retained %v after switching to keep_newest\n\n", ids(got))
 
 	// 4) Audit trail: every drop/eviction states the reason and the rule
 	//    version the message had matched.
