@@ -1,6 +1,6 @@
 # 消息路由框架（message-router）
 
-一个本地进程内的消息路由库：发布者按主题与属性发布不可变消息，订阅者用多条规则匹配并从 Go channel 消费。发布永不阻塞，慢订阅者不会影响其他订阅者，取消订阅时已接收的积压消息会排空（drain）后再关闭 channel。
+一个本地进程内的消息路由库：发布者按主题与属性发布不可变消息，订阅者用多条规则匹配并从 Go channel 消费。发布永不阻塞，慢订阅者不会影响其他订阅者。订阅者可以暂停接收并在之后接续；取消订阅是硬边界——取消返回后不再交付任何消息，未接收的积压被明确放弃并记入审计。
 
 ## 快速开始
 
@@ -18,8 +18,8 @@ _ = router.Publish(msg)
 d := <-sub.Deliveries // 必须真正消费
 fmt.Println(d.Message.ID(), d.RuleIDs, d.RuleVersion)
 
-_ = router.Unsubscribe("alerts")
-for d := range sub.Deliveries { // 取消后排空积压，channel 随后关闭
+_ = router.Unsubscribe("alerts") // 取消是硬边界：未接收的积压被放弃并记录
+for d := range sub.Deliveries {  // 只能读到取消前已交付的消息，channel 随即关闭
     _ = d
 }
 ```
@@ -65,22 +65,35 @@ go run ./examples/demo
 - 切换只影响目标订阅者；取消订阅后再调用返回 `ErrSubscriptionGone`，取消后迟到的发送也不会再交付。
 - 非法策略或空订阅 ID 会被拒绝并记入审计（`invalid_overflow_policy` / `invalid_subscription`），原策略保持不变。
 
-## 取消与排空语义
+## 取消语义（硬边界）
 
 `Unsubscribe(id)` 的保证：
 
 1. 订阅者立即从路由表移除，之后的发布不会再投递给它；
 2. 等待当前正在进行的投递（`Publish` 持有快照后的那一步）完成，因此取消与发布并发时不会有 goroutine 向已关闭 channel 发送；
-3. **不会**丢弃已经进入有界缓冲的消息：消费者继续按顺序读完全部积压，channel 在最后一条之后关闭（`range` 自然结束）。
+3. **取消返回后不再向该订阅交付任何消息**：所有尚未被消费者接收的消息（缓冲积压与交接中的那一条）在取消边界被放弃，逐条记入审计（`Code = "subscription_cancelled"`），channel 随即关闭；
+4. **已经交给接收者的消息**归接收者所有，不会被回收或重复计数——取消只放弃“未接收”的部分；
+5. 其他订阅的进度完全不受影响；同名重新订阅是全新订阅（规则版本回到 1），旧订阅的剩余消息绝不会迁移到新订阅。
 
 重复取消或取消不存在的订阅返回 `ErrSubscriptionGone`。
+
+## 暂停与恢复
+
+`Pause(id)` 让订阅者暂停接收：pump 停止向消费者交接，但发布照常进行，匹配到的消息仍进入该订阅的有界缓冲，**保留范围由该订阅自己的约定决定**（`KeepOldest` / `KeepNewest` 与各自的缓冲大小）。暂停期间发布者从不被拖住，其他订阅者不受影响。
+
+`Resume(id)` 恢复交付，并返回 `ResumeReport` 先说明结果：
+
+- `Replayable`：仍可补发的消息 ID（按即将交付的顺序），恢复后它们就在原 channel 上按序到达；
+- `Evicted`：暂停期间被保留策略淘汰的消息 ID，即明确的缺口。
+
+暂停、取消与 `SetOverflowPolicy` 可以任意交错：暂停中切换保留策略只影响后续投递；暂停中取消则积压按取消语义放弃；已暂停的订阅不能重复暂停（`ErrSubscriptionPaused`），未暂停的订阅不能恢复（`ErrSubscriptionNotPaused`），目标不存在时两者都返回 `ErrSubscriptionGone`。
 
 ## 审计记录
 
 `Records()` 返回环形审计历史（容量由 `WithHistorySize` 控制，默认 128），每条记录包含：
 
 - `Kind`：`rejected`（非法消息/规则/订阅）或 `dropped`（因慢消费者丢弃或淘汰）；
-- `Code` / `Reason`：机器可读原因码与文字说明，例如 `subscriber_buffer_full`、`subscriber_buffer_evicted`；
+- `Code` / `Reason`：机器可读原因码与文字说明，例如 `subscriber_buffer_full`、`subscriber_buffer_evicted`、`subscription_cancelled`（取消边界放弃的未接收消息）；
 - `MessageID`、`Topic`、`SubscriptionID`：定位具体消息与订阅者；
 - `RuleIDs`、`RuleVersion`：该消息当时命中的规则与规则版本，丢弃与淘汰记录同样携带，方便在并发换规则后还原“它本来会按哪版规则交给谁”。
 
@@ -94,6 +107,8 @@ go run ./examples/demo
 | `UpdateRules(id, rules)` | 原子替换规则集，成功后版本加 1 |
 | `SetOverflowPolicy(id, policy)` | 运行中切换溢出策略；积压保留，新策略对后续投递生效 |
 | `Publish(msg)` | 非阻塞分发；慢订阅者按溢出策略丢弃并记录 |
-| `Unsubscribe(id)` | 停止新投递，排空积压后关闭 channel |
+| `Unsubscribe(id)` | 硬边界取消：未接收的积压被放弃并记录，返回后不再交付 |
+| `Pause(id)` | 暂停接收；发布照常，保留范围由该订阅自己的溢出策略决定 |
+| `Resume(id)` | 恢复交付，返回 `ResumeReport` 说明可补发内容与已淘汰缺口 |
 | `Records()` | 读取拒绝/丢弃/淘汰审计记录 |
 | `WithOverflowPolicy` | `KeepOldest`（默认）或 `KeepNewest` |

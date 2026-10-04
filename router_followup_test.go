@@ -31,11 +31,11 @@ func TestDeliveriesCarryRuleVersion(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m2", "t", nil)); err != nil {
 		t.Fatal(err)
 	}
+	deliveries := receive(t, sub, 2)
 	if err := router.Unsubscribe("sub"); err != nil {
 		t.Fatal(err)
 	}
 
-	deliveries := drain(sub)
 	if len(deliveries) != 2 {
 		t.Fatalf("deliveries = %d, want 2", len(deliveries))
 	}
@@ -65,11 +65,11 @@ func TestRejectedUpdateKeepsVersion(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m1", "t", nil)); err != nil {
 		t.Fatal(err)
 	}
+	deliveries := receive(t, sub, 1)
 	if err := router.Unsubscribe("sub"); err != nil {
 		t.Fatal(err)
 	}
 
-	deliveries := drain(sub)
 	if len(deliveries) != 1 || deliveries[0].RuleVersion != 1 {
 		t.Fatalf("deliveries = %#v, want one version-1 delivery", deliveries)
 	}
@@ -96,23 +96,49 @@ func TestKeepNewestEvictsOldest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The slow subscriber is paused, so every unreceived message competes
+	// under the retention policy alone.
+	if err := router.Pause("slow"); err != nil {
+		t.Fatal(err)
+	}
 	fastDone := make(chan []Delivery, 1)
-	go func() { fastDone <- drain(fast) }()
-
+	go func() { fastDone <- receive(t, fast, 5) }()
 	ids := []string{"m1", "m2", "m3", "m4", "m5"}
 	for _, id := range ids {
 		if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := router.Unsubscribe("slow"); err != nil {
-		t.Fatal(err)
+	if fast := <-fastDone; len(fast) != 5 {
+		t.Fatalf("fast deliveries = %d, want 5", len(fast))
 	}
 	if err := router.Unsubscribe("fast"); err != nil {
 		t.Fatal(err)
 	}
 
-	got := drain(slow)
+	// Resume reports exactly what can be replayed and which messages were
+	// evicted during the pause: the newest three survive, in order.
+	report, err := router.Resume("slow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"m3", "m4", "m5"}
+	if len(report.Replayable) != len(want) {
+		t.Fatalf("replayable = %v, want %v", report.Replayable, want)
+	}
+	for index, id := range want {
+		if report.Replayable[index] != id {
+			t.Fatalf("replayable %d = %q, want %q", index, report.Replayable[index], id)
+		}
+	}
+	if len(report.Evicted) != 2 || report.Evicted[0] != "m1" || report.Evicted[1] != "m2" {
+		t.Fatalf("evicted = %v, want [m1 m2]", report.Evicted)
+	}
+	got := receive(t, slow, 3)
+	if err := router.Unsubscribe("slow"); err != nil {
+		t.Fatal(err)
+	}
+
 	if len(got) != 3 {
 		t.Fatalf("slow deliveries = %d, want exactly 3: %#v", len(got), got)
 	}
@@ -121,16 +147,10 @@ func TestKeepNewestEvictsOldest(t *testing.T) {
 			t.Fatalf("delivery %q version = %d, want 1", delivery.Message.ID(), delivery.RuleVersion)
 		}
 	}
-	// The consumer never read, so every unreceived message competes under
-	// the same policy: exactly the newest three survive, in order.
-	want := []string{"m3", "m4", "m5"}
 	for index, id := range want {
 		if got[index].Message.ID() != id {
 			t.Fatalf("delivery %d = %q, want %q; all: %#v", index, got[index].Message.ID(), id, got)
 		}
-	}
-	if fast := <-fastDone; len(fast) != 5 {
-		t.Fatalf("fast deliveries = %d, want 5", len(fast))
 	}
 
 	var evictions, rejects int
@@ -197,7 +217,10 @@ func TestSetOverflowPolicySwitchKeepsBacklog(t *testing.T) {
 		}
 	}
 
-	// Consumer paused. KeepOldest: m1, m2 accepted; m3 dropped.
+	// Subscription paused. KeepOldest: m1, m2 accepted; m3 dropped.
+	if err := router.Pause("sub"); err != nil {
+		t.Fatal(err)
+	}
 	publish("m1", "m2", "m3")
 	if err := router.SetOverflowPolicy("sub", KeepNewest); err != nil {
 		t.Fatal(err)
@@ -210,14 +233,24 @@ func TestSetOverflowPolicySwitchKeepsBacklog(t *testing.T) {
 	}
 	// KeepOldest again: buffer full, m6 dropped.
 	publish("m6")
+	report, err := router.Resume("sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"m4", "m5"}
+	if len(report.Replayable) != len(want) {
+		t.Fatalf("replayable = %v, want %v", report.Replayable, want)
+	}
+	if len(report.Evicted) != 4 {
+		t.Fatalf("evicted = %v, want 4 gaps (m1, m2, m3, m6)", report.Evicted)
+	}
+	got := receive(t, sub, 2)
 	if err := router.Unsubscribe("sub"); err != nil {
 		t.Fatal(err)
 	}
 	// Nothing accepted after cancellation may be delivered.
 	publish("m7")
 
-	got := drain(sub)
-	want := []string{"m4", "m5"}
 	if len(got) != len(want) {
 		t.Fatalf("deliveries = %#v, want %v", got, want)
 	}
@@ -269,9 +302,6 @@ func TestSetOverflowPolicyValidationAndIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fastDone := make(chan []Delivery, 1)
-	go func() { fastDone <- drain(fast) }()
-
 	if err := router.SetOverflowPolicy("", KeepNewest); err == nil {
 		t.Fatal("empty subscription id unexpectedly accepted")
 	}
@@ -285,17 +315,28 @@ func TestSetOverflowPolicyValidationAndIsolation(t *testing.T) {
 	if err := router.SetOverflowPolicy("slow", KeepNewest); err != nil {
 		t.Fatal(err)
 	}
+	if err := router.Pause("slow"); err != nil {
+		t.Fatal(err)
+	}
 	for _, id := range []string{"m1", "m2", "m3"} {
 		if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
+	if got := receive(t, fast, 3); len(got) != 3 {
+		t.Fatalf("fast deliveries = %d, want 3: policy switch leaked across subscribers", len(got))
+	}
 	if err := router.Unsubscribe("fast"); err != nil {
 		t.Fatal(err)
 	}
-	if got := <-fastDone; len(got) != 3 {
-		t.Fatalf("fast deliveries = %d, want 3: policy switch leaked across subscribers", len(got))
+	report, err := router.Resume("slow")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(report.Replayable) != 1 || report.Replayable[0] != "m3" {
+		t.Fatalf("replayable = %v, want [m3]", report.Replayable)
+	}
+	got := receive(t, slow, 1)
 	if err := router.Unsubscribe("slow"); err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +347,6 @@ func TestSetOverflowPolicyValidationAndIsolation(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m4", "t", nil)); err != nil {
 		t.Fatal(err)
 	}
-	got := drain(slow)
 	if len(got) != 1 || got[0].Message.ID() != "m3" {
 		t.Fatalf("slow deliveries = %#v, want only m3", got)
 	}
@@ -338,6 +378,9 @@ func TestKeepNewestExactSequenceAcrossCapacities(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			if err := router.Pause("sub"); err != nil {
+				t.Fatal(err)
+			}
 			const total = 8
 			for index := 0; index < total; index++ {
 				id := string(rune('a' + index))
@@ -345,11 +388,21 @@ func TestKeepNewestExactSequenceAcrossCapacities(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			report, err := router.Resume("sub")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.Replayable) != capacity {
+				t.Fatalf("capacity %d: replayable = %v, want %d messages", capacity, report.Replayable, capacity)
+			}
+			if len(report.Evicted) != total-capacity {
+				t.Fatalf("capacity %d: evicted = %v, want %d gaps", capacity, report.Evicted, total-capacity)
+			}
+			got := receive(t, sub, capacity)
 			if err := router.Unsubscribe("sub"); err != nil {
 				t.Fatal(err)
 			}
 
-			got := drain(sub)
 			if len(got) != capacity {
 				t.Fatalf("capacity %d: deliveries = %d, want %d: %#v", capacity, len(got), capacity, got)
 			}
@@ -387,6 +440,9 @@ func TestConcurrentPublishPausedConsumerKeepNewest(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := router.Pause("sub"); err != nil {
+		t.Fatal(err)
+	}
 	const workers = 4
 	const perWorker = 100
 	var publishers sync.WaitGroup
@@ -400,11 +456,20 @@ func TestConcurrentPublishPausedConsumerKeepNewest(t *testing.T) {
 		}(worker)
 	}
 	publishers.Wait()
+	report, err := router.Resume("sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Replayable) > 4 {
+		t.Fatalf("replayable = %d, want at most buffer size 4", len(report.Replayable))
+	}
+	done := make(chan []Delivery, 1)
+	go func() { done <- drain(sub) }()
 	if err := router.Unsubscribe("sub"); err != nil {
 		t.Fatal(err)
 	}
 
-	got := drain(sub)
+	got := <-done
 	if len(got) > 4 {
 		t.Fatalf("retained = %d, want at most buffer size 4", len(got))
 	}
@@ -413,6 +478,9 @@ func TestConcurrentPublishPausedConsumerKeepNewest(t *testing.T) {
 		if record.Kind != RecordDropped {
 			t.Fatalf("unexpected record: %#v", record)
 		}
+		if record.Code != "subscriber_buffer_evicted" && record.Code != "subscription_cancelled" {
+			t.Fatalf("unexpected drop code: %#v", record)
+		}
 		drops++
 	}
 	if got, want := len(got)+drops, workers*perWorker; got != want {
@@ -420,10 +488,12 @@ func TestConcurrentPublishPausedConsumerKeepNewest(t *testing.T) {
 	}
 }
 
-// Messages already accepted when Unsubscribe is called are a drain backlog:
-// they are all delivered in order after cancellation, under either
-// overflow policy, and nothing new is accepted afterwards.
-func TestUnsubscribeDrainsBacklogUnderBothPolicies(t *testing.T) {
+// Messages still unreceived when Unsubscribe is called are discarded at
+// the cancellation boundary under either overflow policy: nothing is
+// delivered after Unsubscribe returns, every discarded message is recorded
+// with code "subscription_cancelled", and nothing new is accepted
+// afterwards. Messages the consumer already received are unaffected.
+func TestUnsubscribeDiscardsBacklogUnderBothPolicies(t *testing.T) {
 	for _, policy := range []OverflowPolicy{KeepOldest, KeepNewest} {
 		t.Run(string(policy), func(t *testing.T) {
 			router, err := NewRouter()
@@ -436,6 +506,9 @@ func TestUnsubscribeDrainsBacklogUnderBothPolicies(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			if err := router.Pause("sub"); err != nil {
+				t.Fatal(err)
+			}
 			for _, id := range []string{"m1", "m2", "m3", "m4"} {
 				if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
 					t.Fatal(err)
@@ -448,14 +521,18 @@ func TestUnsubscribeDrainsBacklogUnderBothPolicies(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			got := drain(sub)
-			if len(got) != 4 {
-				t.Fatalf("drained = %d, want 4: %#v", len(got), got)
+			if got := drain(sub); len(got) != 0 {
+				t.Fatalf("deliveries after cancellation = %#v, want none", got)
 			}
-			want := []string{"m1", "m2", "m3", "m4"}
-			for index, delivery := range got {
-				if delivery.Message.ID() != want[index] {
-					t.Fatalf("delivery %d = %q, want %q", index, delivery.Message.ID(), want[index])
+			cancelled := make(map[string]bool)
+			for _, record := range router.Records() {
+				if record.Kind == RecordDropped && record.Code == "subscription_cancelled" {
+					cancelled[record.MessageID] = true
+				}
+			}
+			for _, id := range []string{"m1", "m2", "m3", "m4"} {
+				if !cancelled[id] {
+					t.Fatalf("message %q not recorded as cancelled: %v", id, cancelled)
 				}
 			}
 		})

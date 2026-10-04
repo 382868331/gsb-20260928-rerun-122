@@ -9,11 +9,13 @@ import (
 )
 
 var (
-	ErrInvalidMessage      = errors.New("invalid message")
-	ErrInvalidSubscription = errors.New("invalid subscription")
-	ErrInvalidRule         = errors.New("invalid rule")
-	ErrSubscriptionExists  = errors.New("subscription already exists")
-	ErrSubscriptionGone    = errors.New("subscription not found")
+	ErrInvalidMessage        = errors.New("invalid message")
+	ErrInvalidSubscription   = errors.New("invalid subscription")
+	ErrInvalidRule           = errors.New("invalid rule")
+	ErrSubscriptionExists    = errors.New("subscription already exists")
+	ErrSubscriptionGone      = errors.New("subscription not found")
+	ErrSubscriptionPaused    = errors.New("subscription already paused")
+	ErrSubscriptionNotPaused = errors.New("subscription not paused")
 )
 
 const (
@@ -166,6 +168,17 @@ type Subscription struct {
 	Deliveries <-chan Delivery
 }
 
+// ResumeReport describes what a paused subscription can still replay and
+// which messages were evicted while it was paused. Replayable lists the
+// buffered message IDs in the exact order they will be delivered once the
+// subscription resumes; Evicted lists the messages the retention policy
+// dropped during the pause, so the subscriber can see the gaps explicitly.
+type ResumeReport struct {
+	SubscriptionID string
+	Replayable     []string
+	Evicted        []string
+}
+
 type subscription struct {
 	id         string
 	bufferSize int
@@ -196,8 +209,23 @@ type subscription struct {
 	// actually received the message, so nothing was evicted).
 	reconciled *Delivery
 
+	// paused stops the pump from handing deliveries to the consumer.
+	// Offers still enter the bounded buffer and the retention policy
+	// keeps applying while paused.
+	paused bool
+	// pausedDrops accumulates the IDs of messages dropped or evicted
+	// while paused; Resume reports them as the replay gaps.
+	pausedDrops []string
+
 	notify   chan struct{}
 	inFlight sync.WaitGroup
+	// done is closed when the pump goroutine exits; Unsubscribe waits
+	// for it so no delivery can be sent after cancellation returns.
+	done chan struct{}
+	// discarded is set by the pump as it exits after close: every
+	// accepted-but-unreceived delivery, in original order. Unsubscribe
+	// reads it after done closes and records the cancellations.
+	discarded []Delivery
 }
 
 type Router struct {
@@ -251,6 +279,7 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 	entry.version = 1
 	entry.queued = make([]Delivery, maxInt(entry.bufferSize, 1))
 	entry.notify = make(chan struct{}, 1)
+	entry.done = make(chan struct{})
 
 	r.mu.Lock()
 	if _, exists := r.subscribers[id]; exists {
@@ -281,6 +310,7 @@ func (s *subscription) snapshot() ([]Rule, int) {
 // consumer send and an eviction race, the actual outcome decides the audit
 // record: a message the consumer received is never reported as evicted.
 func (s *subscription) pump(router *Router) {
+	defer close(s.done)
 	for {
 		s.mu.Lock()
 		if s.reconciled != nil {
@@ -300,6 +330,31 @@ func (s *subscription) pump(router *Router) {
 			})
 			continue
 		}
+		if s.closed {
+			// Collect every accepted-but-unreceived delivery exactly
+			// once. Because the pump itself does this right before
+			// exiting, a handoff that already completed can never be
+			// counted as discarded.
+			if s.pending != nil {
+				s.discarded = append(s.discarded, *s.pending)
+				s.pending = nil
+			}
+			for index := 0; index < s.count; index++ {
+				s.discarded = append(s.discarded, s.queued[(s.head+index)%len(s.queued)])
+				s.queued[(s.head+index)%len(s.queued)] = Delivery{}
+			}
+			s.head = 0
+			s.count = 0
+			s.mu.Unlock()
+			close(s.deliveries)
+			return
+		}
+		if s.paused {
+			notify := s.notify
+			s.mu.Unlock()
+			<-notify
+			continue
+		}
 		if s.pending == nil {
 			if s.count > 0 {
 				delivery := s.queued[s.head]
@@ -308,10 +363,6 @@ func (s *subscription) pump(router *Router) {
 				s.count--
 				s.pending = &delivery
 				s.gen++
-			} else if s.closed {
-				s.mu.Unlock()
-				close(s.deliveries)
-				return
 			}
 		}
 		delivery := s.pending
@@ -474,6 +525,7 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 			s.pending = nil
 			s.gen++
 			s.reconciled = &evicted
+			s.notePausedDrop(evicted.Message.id)
 			capacity := len(s.queued)
 			s.queued[(s.head+s.count)%capacity] = delivery
 			s.count++
@@ -485,15 +537,28 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 		s.queued[s.head] = Delivery{}
 		s.head = (s.head + 1) % capacity
 		s.queued[(s.head+s.count-1)%capacity] = delivery
+		s.notePausedDrop(evicted.Message.id)
 		s.signal()
 		return evicted, "subscriber_buffer_evicted"
 	}
 
+	s.notePausedDrop(delivery.Message.id)
 	return delivery, "subscriber_buffer_full"
 }
 
-// close marks the subscription closed; the pump finishes sending every
-// queued message and then closes the consumer channel.
+// notePausedDrop remembers a message discarded while the subscription is
+// paused so Resume can report the exact replay gap. Callers hold s.mu.
+func (s *subscription) notePausedDrop(messageID string) {
+	if s.paused {
+		s.pausedDrops = append(s.pausedDrops, messageID)
+	}
+}
+
+// close marks the subscription closed and wakes the pump. The pump then
+// discards every accepted-but-unreceived delivery into s.discarded, closes
+// the consumer channel, and exits; Unsubscribe waits for that exit before
+// recording the discarded messages, so a message is never both delivered
+// and reported as cancelled.
 func (s *subscription) close() {
 	s.mu.Lock()
 	s.closed = true
@@ -583,9 +648,15 @@ func (r *Router) Publish(message Message) error {
 }
 
 // Unsubscribe prevents new deliveries and waits for in-flight offers to
-// finish. It then marks the subscription closed: every message already
-// accepted into the bounded buffer (the drain backlog) is still delivered
-// to the consumer in order, followed by channel close.
+// finish. It then cancels the subscription outright: every message the
+// consumer has not received yet (buffered backlog plus any in-flight
+// handoff) is discarded and recorded with code "subscription_cancelled",
+// and the delivery channel is closed. Once Unsubscribe returns, no further
+// delivery can reach the consumer — the pump goroutine has already exited.
+// Messages the consumer did receive before cancellation remain theirs to
+// keep; nothing is reclaimed. Other subscriptions are unaffected, and a
+// later Subscribe with the same ID starts from a completely fresh state:
+// no leftover messages ever migrate to the new subscription.
 func (r *Router) Unsubscribe(id string) error {
 	r.mu.Lock()
 	entry, ok := r.subscribers[id]
@@ -598,7 +669,121 @@ func (r *Router) Unsubscribe(id string) error {
 
 	entry.inFlight.Wait()
 	entry.close()
+	<-entry.done
+	for _, delivery := range entry.discarded {
+		r.addRecord(Record{
+			Time:           time.Now(),
+			Kind:           RecordDropped,
+			Code:           "subscription_cancelled",
+			Reason:         "subscription cancelled; unreceived message discarded at the cancellation boundary",
+			MessageID:      delivery.Message.id,
+			Topic:          delivery.Message.topic,
+			SubscriptionID: delivery.SubscriptionID,
+			RuleIDs:        append([]string(nil), delivery.RuleIDs...),
+			RuleVersion:    delivery.RuleVersion,
+		})
+	}
 	return nil
+}
+
+// Pause stops the pump from handing deliveries to the consumer. Publishing
+// continues unaffected: matched messages still enter the subscription's
+// bounded buffer and the subscription's own retention policy (KeepOldest or
+// KeepNewest) decides what survives while it is paused. The publisher never
+// blocks on a paused subscriber, and other subscriptions are unaffected.
+func (r *Router) Pause(id string) error {
+	if id == "" {
+		err := fmt.Errorf("%w: subscription id is required", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "invalid_subscription",
+			Reason: err.Error(),
+		})
+		return err
+	}
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_gone",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return err
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.paused {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionPaused, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_already_paused",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return err
+	}
+	entry.paused = true
+	entry.signal()
+	return nil
+}
+
+// Resume restarts delivery for a paused subscription and reports what can
+// be replayed: the buffered messages (in delivery order) and the messages
+// the retention policy evicted during the pause. The replay itself happens
+// on the subscription's existing delivery channel right after Resume
+// returns. Resuming a subscription that is not paused is rejected.
+func (r *Router) Resume(id string) (ResumeReport, error) {
+	if id == "" {
+		err := fmt.Errorf("%w: subscription id is required", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "invalid_subscription",
+			Reason: err.Error(),
+		})
+		return ResumeReport{}, err
+	}
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_gone",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return ResumeReport{}, err
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if !entry.paused {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionNotPaused, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_not_paused",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return ResumeReport{}, err
+	}
+	report := ResumeReport{SubscriptionID: id}
+	if entry.pending != nil {
+		report.Replayable = append(report.Replayable, entry.pending.Message.id)
+	}
+	for index := 0; index < entry.count; index++ {
+		report.Replayable = append(report.Replayable,
+			entry.queued[(entry.head+index)%len(entry.queued)].Message.id)
+	}
+	report.Evicted = append([]string(nil), entry.pausedDrops...)
+	entry.pausedDrops = nil
+	entry.paused = false
+	entry.signal()
+	return report, nil
 }
 
 func (r *Router) Records() []Record {

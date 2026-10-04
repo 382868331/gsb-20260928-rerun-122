@@ -23,6 +23,22 @@ func drain(sub Subscription) []Delivery {
 	return deliveries
 }
 
+// receive reads exactly n deliveries, failing if the channel closes first.
+// Use it to synchronize the consumer with the publisher before Unsubscribe,
+// because cancellation discards everything not yet received.
+func receive(t *testing.T, sub Subscription, n int) []Delivery {
+	t.Helper()
+	var deliveries []Delivery
+	for len(deliveries) < n {
+		delivery, open := <-sub.Deliveries
+		if !open {
+			t.Fatalf("channel closed after %d deliveries, want %d", len(deliveries), n)
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	return deliveries
+}
+
 func TestRoutesByTopicAndAttributes(t *testing.T) {
 	router, err := NewRouter()
 	if err != nil {
@@ -47,11 +63,11 @@ func TestRoutesByTopicAndAttributes(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m3", "ignored", nil)); err != nil {
 		t.Fatal(err)
 	}
+	deliveries := receive(t, sub, 2)
 	if err := router.Unsubscribe("alerts"); err != nil {
 		t.Fatal(err)
 	}
 
-	deliveries := drain(sub)
 	if len(deliveries) != 2 {
 		t.Fatalf("got %d deliveries, want 2: %#v", len(deliveries), deliveries)
 	}
@@ -76,28 +92,44 @@ func TestSlowSubscriberDoesNotBlockOthersAndRecordsDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The slow subscriber pauses before anything is published, so its
+	// retention policy alone decides what survives: with KeepOldest and a
+	// buffer of 1, exactly the first message is retained.
+	if err := router.Pause("slow"); err != nil {
+		t.Fatal(err)
+	}
 	fastDone := make(chan []Delivery, 1)
 	go func() {
-		fastDone <- drain(fast)
+		fastDone <- receive(t, fast, 10)
 	}()
-
 	for index := 0; index < 10; index++ {
 		if err := router.Publish(mustMessage(t, string(rune('a'+index)), "t", nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
+	if got := len(<-fastDone); got != 10 {
+		t.Fatalf("fast deliveries = %d, want 10", got)
+	}
 
 	if err := router.Unsubscribe("fast"); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(<-fastDone); got != 10 {
-		t.Fatalf("fast deliveries = %d, want 10", got)
+	report, err := router.Resume("slow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Replayable) != 1 || report.Replayable[0] != "a" {
+		t.Fatalf("replayable = %v, want [a]", report.Replayable)
+	}
+	if len(report.Evicted) != 9 {
+		t.Fatalf("evicted = %v, want 9 gaps", report.Evicted)
+	}
+	got := receive(t, slow, 1)
+	if got[0].Message.ID() != "a" {
+		t.Fatalf("slow deliveries = %#v, want only the oldest message a", got)
 	}
 	if err := router.Unsubscribe("slow"); err != nil {
 		t.Fatal(err)
-	}
-	if got := drain(slow); len(got) != 1 || got[0].Message.ID() != "a" {
-		t.Fatalf("slow deliveries = %#v, want only the oldest message a", got)
 	}
 
 	records := router.Records()
@@ -142,11 +174,11 @@ func TestUpdateRulesAreAtomicAndRejectedInvalidInput(t *testing.T) {
 	if !errors.Is(err, ErrSubscriptionGone) {
 		t.Fatalf("missing update error = %v, want ErrSubscriptionGone", err)
 	}
+	deliveries := receive(t, sub, 1)
 	if err := router.Unsubscribe("sub"); err != nil {
 		t.Fatal(err)
 	}
 
-	deliveries := drain(sub)
 	if len(deliveries) != 1 || deliveries[0].Message.ID() != "m2" {
 		t.Fatalf("deliveries = %#v, want only m2", deliveries)
 	}
@@ -161,7 +193,11 @@ func TestUpdateRulesAreAtomicAndRejectedInvalidInput(t *testing.T) {
 	}
 }
 
-func TestUnsubscribeFinishesInFlightAndDeliversQueuedMessages(t *testing.T) {
+// Cancellation is a hard boundary: once Unsubscribe returns, no queued or
+// in-flight message is delivered any more. The unreceived backlog is
+// discarded and each discarded message is recorded, while messages the
+// consumer already received remain theirs.
+func TestUnsubscribeDiscardsBacklogAndClosesChannel(t *testing.T) {
 	router, err := NewRouter(WithBufferSize(2))
 	if err != nil {
 		t.Fatal(err)
@@ -183,14 +219,21 @@ func TestUnsubscribeFinishesInFlightAndDeliversQueuedMessages(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m3", "t", nil)); err != nil {
 		t.Fatal(err)
 	}
-	if _, open := <-sub.Deliveries; !open {
-		t.Fatal("delivery channel closed before queued delivery")
-	}
-	if _, open := <-sub.Deliveries; !open {
-		t.Fatal("delivery channel closed before queued delivery")
-	}
 	if _, open := <-sub.Deliveries; open {
-		t.Fatal("delivery channel remains open after unsubscribe")
+		t.Fatal("delivery received after unsubscribe returned; want closed channel")
+	}
+
+	cancelled := make(map[string]bool)
+	for _, record := range router.Records() {
+		if record.Kind == RecordDropped && record.Code == "subscription_cancelled" {
+			cancelled[record.MessageID] = true
+			if record.SubscriptionID != "sub" || record.RuleVersion != 1 {
+				t.Fatalf("cancel record targets wrong subscription or version: %#v", record)
+			}
+		}
+	}
+	if !cancelled["m1"] || !cancelled["m2"] || len(cancelled) != 2 {
+		t.Fatalf("cancelled backlog = %v, want m1 and m2", cancelled)
 	}
 }
 

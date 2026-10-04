@@ -1,7 +1,9 @@
 // Command demo is a self-contained walkthrough of the message-router:
-// real consumers read every delivery, multi-rule matches, successive rule
-// updates with version stamps, slow subscribers under both overflow
-// policies, and draining a backlog after unsubscribe.
+// multi-rule matches with version stamps, two receivers of different
+// speeds, publishing while a subscriber is paused, resuming with a replay
+// report, the exact cancellation boundary, resubscribing from scratch,
+// and a simulated process restart. Every delivered and every explicitly
+// abandoned message is checked at the end.
 package main
 
 import (
@@ -18,127 +20,16 @@ func mustMsg(id, topic string, attrs map[string]string) router.Message {
 	return msg
 }
 
-func consume(name string, sub router.Subscription) []router.Delivery {
+func receive(sub router.Subscription, n int) []router.Delivery {
 	var got []router.Delivery
-	for delivery := range sub.Deliveries {
-		fmt.Printf("  [%s] consume %-3s rules=%v ruleVersion=%d\n",
-			name, delivery.Message.ID(), delivery.RuleIDs, delivery.RuleVersion)
+	for len(got) < n {
+		delivery, open := <-sub.Deliveries
+		if !open {
+			panic(fmt.Sprintf("channel of %s closed after %d deliveries, want %d", sub.ID, len(got), n))
+		}
 		got = append(got, delivery)
 	}
 	return got
-}
-
-func main() {
-	// 1) Multi-rule matches plus successive rule updates. Each delivery
-	//    carries the exact rule-set version that produced it.
-	fmt.Println("== multi-rule matches and rule versions ==")
-	r, err := router.NewRouter()
-	if err != nil {
-		panic(err)
-	}
-	sub, err := r.Subscribe("alerts", []router.Rule{
-		{ID: "all-alerts", Topic: "alerts"},
-		{ID: "critical", Topic: "alerts", Attrs: map[string]string{"severity": "critical"}},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_ = r.Publish(mustMsg("m1", "alerts", map[string]string{"severity": "critical"})) // hits v1: both rules
-	if err := r.UpdateRules("alerts", []router.Rule{{ID: "only-critical", Topic: "alerts",
-		Attrs: map[string]string{"severity": "critical"}}}); err != nil { // v2
-		panic(err)
-	}
-	if err := r.UpdateRules("alerts", []router.Rule{{ID: "only-info", Topic: "alerts",
-		Attrs: map[string]string{"severity": "info"}}}); err != nil { // v3
-		panic(err)
-	}
-	_ = r.Publish(mustMsg("m2", "alerts", map[string]string{"severity": "critical"})) // v3: no match
-	_ = r.Publish(mustMsg("m3", "alerts", map[string]string{"severity": "info"}))     // v3: match
-
-	if err := r.Unsubscribe("alerts"); err != nil {
-		panic(err)
-	}
-	deliveries := consume("alerts", sub)
-	fmt.Printf("  consumed %d deliveries, channel closed after drain\n\n", len(deliveries))
-
-	// 2) Slow subscribers: KeepOldest drops the newest messages, while a
-	//    fast subscriber is never affected.
-	fmt.Println("== slow subscriber, KeepOldest (default) ==")
-	slowOld, err := r.Subscribe("slow-old", []router.Rule{{ID: "t", Topic: "t"}},
-		router.WithSubscriptionBufferSize(2))
-	if err != nil {
-		panic(err)
-	}
-	fast, err := r.Subscribe("fast", []router.Rule{{ID: "t", Topic: "t"}},
-		router.WithSubscriptionBufferSize(8))
-	if err != nil {
-		panic(err)
-	}
-	fastDone := make(chan int, 1)
-	go func() {
-		fastDone <- len(consume("fast", fast))
-	}()
-	for _, id := range []string{"a", "b", "c", "d", "e"} {
-		_ = r.Publish(mustMsg(id, "t", nil))
-	}
-	_ = r.Unsubscribe("fast")
-	if got := <-fastDone; got != 5 {
-		panic(fmt.Sprintf("fast got %d, want 5", got))
-	}
-	_ = r.Unsubscribe("slow-old")
-	got := consume("slow-old", slowOld)
-	fmt.Printf("  slow retained %v (oldest kept)\n\n", ids(got))
-
-	// 3) Slow subscribers: KeepNewest evicts the oldest buffered messages
-	//    so the newest batch survives; each eviction is recorded with the
-	//    matched rule version.
-	fmt.Println("== slow subscriber, KeepNewest ==")
-	slowNew, err := r.Subscribe("slow-new", []router.Rule{{ID: "t", Topic: "t"}},
-		router.WithSubscriptionBufferSize(2), router.WithOverflowPolicy(router.KeepNewest))
-	if err != nil {
-		panic(err)
-	}
-	for _, id := range []string{"f", "g", "h", "i", "j"} {
-		_ = r.Publish(mustMsg(id, "t", nil))
-	}
-	// Unsubscribe while messages are still buffered: the retained backlog
-	// is fully drained before the channel closes.
-	_ = r.Unsubscribe("slow-new")
-	got = consume("slow-new", slowNew)
-	fmt.Printf("  slow retained %v (exactly the newest 2: i, j)\n\n", ids(got))
-
-	// 3b) Switch the overflow policy while the subscription is running. The
-	//     backlog is kept; only new deliveries observe the new policy.
-	fmt.Println("== runtime overflow policy switch ==")
-	switcher, err := r.Subscribe("switcher", []router.Rule{{ID: "t", Topic: "sw"}},
-		router.WithSubscriptionBufferSize(2))
-	if err != nil {
-		panic(err)
-	}
-	for _, id := range []string{"s1", "s2", "s3"} { // KeepOldest: s3 dropped
-		_ = r.Publish(mustMsg(id, "sw", nil))
-	}
-	if err := r.SetOverflowPolicy("switcher", router.KeepNewest); err != nil {
-		panic(err)
-	}
-	for _, id := range []string{"s4", "s5"} { // KeepNewest: evicts s1, s2
-		_ = r.Publish(mustMsg(id, "sw", nil))
-	}
-	_ = r.Unsubscribe("switcher")
-	got = consume("switcher", switcher)
-	fmt.Printf("  retained %v after switching to keep_newest\n\n", ids(got))
-
-	// 4) Audit trail: every drop/eviction states the reason and the rule
-	//    version the message had matched.
-	fmt.Println("== drop / eviction records ==")
-	for _, rec := range r.Records() {
-		if rec.Kind != router.RecordDropped {
-			continue
-		}
-		fmt.Printf("  %s sub=%s msg=%s code=%s ruleVersion=%d\n",
-			rec.Kind, rec.SubscriptionID, rec.MessageID, rec.Code, rec.RuleVersion)
-	}
 }
 
 func ids(deliveries []router.Delivery) []string {
@@ -147,4 +38,153 @@ func ids(deliveries []router.Delivery) []string {
 		out[index] = delivery.Message.ID()
 	}
 	return out
+}
+
+func expect(name string, got, want []string) {
+	if len(got) != len(want) {
+		panic(fmt.Sprintf("%s = %v, want %v", name, got, want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			panic(fmt.Sprintf("%s = %v, want %v", name, got, want))
+		}
+	}
+	fmt.Printf("  ok %s = %v\n", name, got)
+}
+
+func main() {
+	r, err := router.NewRouter()
+	if err != nil {
+		panic(err)
+	}
+
+	// 1) Multi-rule matches plus successive rule updates. Each delivery
+	//    carries the exact rule-set version that produced it.
+	fmt.Println("== multi-rule matches and rule versions ==")
+	alerts, err := r.Subscribe("alerts", []router.Rule{
+		{ID: "all-alerts", Topic: "alerts"},
+		{ID: "critical", Topic: "alerts", Attrs: map[string]string{"severity": "critical"}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	_ = r.Publish(mustMsg("m1", "alerts", map[string]string{"severity": "critical"})) // hits v1: both rules
+	if err := r.UpdateRules("alerts", []router.Rule{{ID: "only-info", Topic: "alerts",
+		Attrs: map[string]string{"severity": "info"}}}); err != nil { // v2
+		panic(err)
+	}
+	_ = r.Publish(mustMsg("m2", "alerts", map[string]string{"severity": "critical"})) // v2: no match
+	_ = r.Publish(mustMsg("m3", "alerts", map[string]string{"severity": "info"}))     // v2: match
+	got := receive(alerts, 2)
+	fmt.Printf("  [%s] consume %-3s rules=%v ruleVersion=%d\n", alerts.ID, got[0].Message.ID(), got[0].RuleIDs, got[0].RuleVersion)
+	fmt.Printf("  [%s] consume %-3s rules=%v ruleVersion=%d\n", alerts.ID, got[1].Message.ID(), got[1].RuleIDs, got[1].RuleVersion)
+	if err := r.Unsubscribe("alerts"); err != nil {
+		panic(err)
+	}
+	fmt.Println()
+
+	// 2) Two receivers of different speeds. The slow one pauses; publishing
+	//    continues and the fast one receives everything. On resume, the
+	//    report names exactly what can be replayed and which messages the
+	//    slow subscription's own retention policy (keep_newest, buffer 2)
+	//    evicted during the pause.
+	fmt.Println("== pause, publish during pause, resume with replay report ==")
+	slow, err := r.Subscribe("slow", []router.Rule{{ID: "t", Topic: "t"}},
+		router.WithSubscriptionBufferSize(2), router.WithOverflowPolicy(router.KeepNewest))
+	if err != nil {
+		panic(err)
+	}
+	fast, err := r.Subscribe("fast", []router.Rule{{ID: "t", Topic: "t"}},
+		router.WithSubscriptionBufferSize(8))
+	if err != nil {
+		panic(err)
+	}
+	if err := r.Pause("slow"); err != nil {
+		panic(err)
+	}
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		_ = r.Publish(mustMsg(id, "t", nil))
+	}
+	expect("fast received while slow paused", ids(receive(fast, 5)), []string{"a", "b", "c", "d", "e"})
+	report, err := r.Resume("slow")
+	if err != nil {
+		panic(err)
+	}
+	expect("resume replayable", report.Replayable, []string{"d", "e"})
+	expect("resume evicted gaps", report.Evicted, []string{"a", "b", "c"})
+	expect("slow replayed deliveries", ids(receive(slow, 2)), []string{"d", "e"})
+	fmt.Println()
+
+	// 3) Cancellation boundary: messages still unreceived when Unsubscribe
+	//    returns are discarded and recorded, never delivered. A
+	//    resubscription under the same ID starts completely fresh: no
+	//    leftover migrates into it.
+	fmt.Println("== cancel discards backlog, resubscribe starts fresh ==")
+	if err := r.Pause("slow"); err != nil {
+		panic(err)
+	}
+	for _, id := range []string{"f", "g", "h"} {
+		_ = r.Publish(mustMsg(id, "t", nil))
+	}
+	expect("fast keeps its own progress", ids(receive(fast, 3)), []string{"f", "g", "h"})
+	if err := r.Unsubscribe("slow"); err != nil {
+		panic(err)
+	}
+	if _, open := <-slow.Deliveries; open {
+		panic("slow received a delivery after Unsubscribe returned")
+	}
+	fmt.Println("  ok slow channel closed at the cancellation boundary; f, g, h discarded and recorded")
+
+	slow2, err := r.Subscribe("slow", []router.Rule{{ID: "t", Topic: "t"}},
+		router.WithSubscriptionBufferSize(2))
+	if err != nil {
+		panic(err)
+	}
+	_ = r.Publish(mustMsg("i", "t", nil))
+	fresh := receive(slow2, 1)
+	expect("resubscribed slow sees only new messages", ids(fresh), []string{"i"})
+	if fresh[0].RuleVersion != 1 {
+		panic(fmt.Sprintf("resubscribed rule version = %d, want fresh 1", fresh[0].RuleVersion))
+	}
+	expect("fast still unaffected", ids(receive(fast, 1)), []string{"i"})
+	if err := r.Unsubscribe("slow"); err != nil {
+		panic(err)
+	}
+	if err := r.Unsubscribe("fast"); err != nil {
+		panic(err)
+	}
+	fmt.Println()
+
+	// 4) Process restart: a brand-new router has no memory of the old one.
+	fmt.Println("== process restart ==")
+	r2, err := router.NewRouter()
+	if err != nil {
+		panic(err)
+	}
+	restarted, err := r2.Subscribe("slow", []router.Rule{{ID: "t", Topic: "t"}})
+	if err != nil {
+		panic(err)
+	}
+	_ = r2.Publish(mustMsg("post-restart", "t", nil))
+	after := receive(restarted, 1)
+	expect("after restart only new messages arrive", ids(after), []string{"post-restart"})
+	if after[0].RuleVersion != 1 {
+		panic(fmt.Sprintf("post-restart rule version = %d, want 1", after[0].RuleVersion))
+	}
+	if err := r2.Unsubscribe("slow"); err != nil {
+		panic(err)
+	}
+	fmt.Println()
+
+	// 5) Audit trail: every abandoned message states its reason, either
+	//    evicted during the pause or discarded at the cancellation
+	//    boundary.
+	fmt.Println("== abandoned message records ==")
+	for _, rec := range r.Records() {
+		if rec.Kind != router.RecordDropped {
+			continue
+		}
+		fmt.Printf("  sub=%-5s msg=%-2s code=%s ruleVersion=%d\n",
+			rec.SubscriptionID, rec.MessageID, rec.Code, rec.RuleVersion)
+	}
 }
