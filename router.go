@@ -135,6 +135,24 @@ func WithHistorySize(size int) Option {
 	}
 }
 
+// WithStateFile makes subscription state recoverable across restarts. The
+// router persists every subscription's rules, rule version, overflow
+// policy, pause state, unreceived backlog, and pause-time gaps to the
+// given file on each state change, and a new Router created with the same
+// file restores them: replay continues from exactly the unreceived
+// messages, cancelled subscriptions stay cancelled, and RecoveryReports
+// describes what can still be replayed and what the retention policy had
+// already evicted.
+func WithStateFile(path string) Option {
+	return func(r *Router) error {
+		if path == "" {
+			return fmt.Errorf("%w: state file path is required", ErrInvalidSubscription)
+		}
+		r.store = &stateStore{path: path}
+		return nil
+	}
+}
+
 type SubscribeOption func(*subscription) error
 
 func WithSubscriptionBufferSize(size int) SubscribeOption {
@@ -177,6 +195,9 @@ type ResumeReport struct {
 	SubscriptionID string
 	Replayable     []string
 	Evicted        []string
+	// Gaps details every evicted message with the reason, the matched
+	// rules, and the retention policy in effect when the gap was created.
+	Gaps []Gap
 }
 
 type subscription struct {
@@ -213,9 +234,10 @@ type subscription struct {
 	// Offers still enter the bounded buffer and the retention policy
 	// keeps applying while paused.
 	paused bool
-	// pausedDrops accumulates the IDs of messages dropped or evicted
-	// while paused; Resume reports them as the replay gaps.
-	pausedDrops []string
+	// gaps accumulates the messages dropped or evicted while paused,
+	// with the reason, matched rules, and policy at gap time; Resume
+	// reports them as the replay gaps.
+	gaps []Gap
 
 	notify   chan struct{}
 	inFlight sync.WaitGroup
@@ -234,6 +256,9 @@ type Router struct {
 	historySize int
 	subscribers map[string]*subscription
 
+	store     *stateStore
+	recovered []RecoveryReport
+
 	auditMu   sync.Mutex
 	history   []Record
 	nextAudit int
@@ -250,7 +275,130 @@ func NewRouter(options ...Option) (*Router, error) {
 			return nil, err
 		}
 	}
+	if r.store != nil {
+		if err := r.recover(); err != nil {
+			return nil, err
+		}
+	}
 	return r, nil
+}
+
+// recover restores every subscription found in the state file. Recovered
+// subscriptions keep their rules, rule version, overflow policy, and pause
+// state; their unreceived backlog is queued again in the original order,
+// and pause-time gaps are restored so Resume and RecoveryReports can still
+// explain them. Cancelled subscriptions are absent from the state file and
+// therefore never come back.
+func (r *Router) recover() error {
+	state, err := r.store.load()
+	if err != nil {
+		return err
+	}
+	for _, persisted := range state.Subscriptions {
+		entry := &subscription{
+			id:         persisted.ID,
+			bufferSize: persisted.BufferSize,
+			overflow:   persisted.Overflow,
+			rules:      persisted.Rules,
+			version:    persisted.Version,
+			paused:     persisted.Paused,
+		}
+		entry.deliveries = make(chan Delivery)
+		entry.queued = make([]Delivery, maxInt(entry.bufferSize, 1))
+		entry.notify = make(chan struct{}, 1)
+		entry.done = make(chan struct{})
+		report := RecoveryReport{SubscriptionID: persisted.ID, Paused: persisted.Paused}
+		for _, delivery := range persisted.Backlog {
+			restored := restoreDelivery(persisted.ID, delivery)
+			entry.queued[(entry.head+entry.count)%len(entry.queued)] = restored
+			entry.count++
+			report.Replayable = append(report.Replayable, restored.Message.id)
+		}
+		for _, gap := range persisted.Gaps {
+			entry.gaps = append(entry.gaps, copyGap(gap))
+			report.Gaps = append(report.Gaps, copyGap(gap))
+		}
+		r.subscribers[persisted.ID] = entry
+		r.recovered = append(r.recovered, report)
+		go entry.pump(r)
+	}
+	return nil
+}
+
+// RecoveryReports describes the subscriptions restored from the state
+// file at startup, in the order they were persisted. Empty when the router
+// was created without WithStateFile or the state file had no subscriptions.
+func (r *Router) RecoveryReports() []RecoveryReport {
+	reports := make([]RecoveryReport, 0, len(r.recovered))
+	for _, report := range r.recovered {
+		report.Replayable = append([]string(nil), report.Replayable...)
+		gaps := make([]Gap, 0, len(report.Gaps))
+		for _, gap := range report.Gaps {
+			gaps = append(gaps, copyGap(gap))
+		}
+		report.Gaps = gaps
+		reports = append(reports, report)
+	}
+	return reports
+}
+
+// Subscription returns the live handle for an active subscription,
+// including one restored from the state file, so a consumer can attach to
+// its delivery channel after a restart.
+func (r *Router) Subscription(id string) (Subscription, bool) {
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		return Subscription{}, false
+	}
+	return Subscription{ID: entry.id, Deliveries: entry.deliveries}, true
+}
+
+// persist writes the current recoverable state of every live subscription.
+// Failures are recorded in the audit history; routing itself continues.
+func (r *Router) persist() {
+	if r.store == nil {
+		return
+	}
+	r.mu.RLock()
+	entries := make([]*subscription, 0, len(r.subscribers))
+	for _, entry := range r.subscribers {
+		entries = append(entries, entry)
+	}
+	r.mu.RUnlock()
+
+	state := persistedState{Subscriptions: make([]persistedSubscription, 0, len(entries))}
+	for _, entry := range entries {
+		entry.mu.Lock()
+		persisted := persistedSubscription{
+			ID:         entry.id,
+			Rules:      append([]Rule(nil), entry.rules...),
+			Version:    entry.version,
+			Overflow:   entry.overflow,
+			BufferSize: entry.bufferSize,
+			Paused:     entry.paused,
+		}
+		if entry.pending != nil {
+			persisted.Backlog = append(persisted.Backlog, persistDelivery(*entry.pending))
+		}
+		for index := 0; index < entry.count; index++ {
+			persisted.Backlog = append(persisted.Backlog,
+				persistDelivery(entry.queued[(entry.head+index)%len(entry.queued)]))
+		}
+		for _, gap := range entry.gaps {
+			persisted.Gaps = append(persisted.Gaps, copyGap(gap))
+		}
+		entry.mu.Unlock()
+		state.Subscriptions = append(state.Subscriptions, persisted)
+	}
+	if err := r.store.save(state); err != nil {
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "persistence_error",
+			Reason: err.Error(),
+		})
+	}
 }
 
 func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) (Subscription, error) {
@@ -290,6 +438,7 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 	r.mu.Unlock()
 
 	go entry.pump(r)
+	r.persist()
 
 	return Subscription{ID: id, Deliveries: ch}, nil
 }
@@ -381,14 +530,18 @@ func (s *subscription) pump(router *Router) {
 			if s.gen == gen {
 				s.pending = nil
 				s.gen++
+				s.mu.Unlock()
+				// The message is now the consumer's; persist so a
+				// restart never replays what was already received.
+				router.persist()
 			} else {
 				// The consumer received a delivery that offer had
 				// already evicted from pending. Received messages are
 				// no longer subject to the retention policy, so the
 				// eviction simply never happened.
 				s.reconciled = nil
+				s.mu.Unlock()
 			}
-			s.mu.Unlock()
 		case <-notify:
 			// State changed (arrival, eviction, or close); re-read
 			// under the lock before retrying the handoff.
@@ -435,6 +588,7 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 	entry.version++
 	entry.mu.Unlock()
 	r.mu.Unlock()
+	r.persist()
 	return nil
 }
 
@@ -484,6 +638,7 @@ func (r *Router) SetOverflowPolicy(subscriptionID string, policy OverflowPolicy)
 	entry.mu.Lock()
 	entry.overflow = policy
 	entry.mu.Unlock()
+	r.persist()
 	return nil
 }
 
@@ -525,7 +680,7 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 			s.pending = nil
 			s.gen++
 			s.reconciled = &evicted
-			s.notePausedDrop(evicted.Message.id)
+			s.noteGap(evicted, "subscriber_buffer_evicted")
 			capacity := len(s.queued)
 			s.queued[(s.head+s.count)%capacity] = delivery
 			s.count++
@@ -537,20 +692,40 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 		s.queued[s.head] = Delivery{}
 		s.head = (s.head + 1) % capacity
 		s.queued[(s.head+s.count-1)%capacity] = delivery
-		s.notePausedDrop(evicted.Message.id)
+		s.noteGap(evicted, "subscriber_buffer_evicted")
 		s.signal()
 		return evicted, "subscriber_buffer_evicted"
 	}
 
-	s.notePausedDrop(delivery.Message.id)
+	s.noteGap(delivery, "subscriber_buffer_full")
 	return delivery, "subscriber_buffer_full"
 }
 
-// notePausedDrop remembers a message discarded while the subscription is
-// paused so Resume can report the exact replay gap. Callers hold s.mu.
-func (s *subscription) notePausedDrop(messageID string) {
+// noteGap remembers a message discarded while the subscription is paused
+// so Resume and recovery reports can explain the exact replay gap: the
+// reason, the matched rules, and the retention policy in effect right
+// now. Later policy switches never rewrite gaps recorded earlier.
+// Callers hold s.mu.
+func (s *subscription) noteGap(delivery Delivery, code string) {
 	if s.paused {
-		s.pausedDrops = append(s.pausedDrops, messageID)
+		s.gaps = append(s.gaps, Gap{
+			MessageID:   delivery.Message.id,
+			Topic:       delivery.Message.topic,
+			Code:        code,
+			Reason:      gapReason(code),
+			RuleIDs:     append([]string(nil), delivery.RuleIDs...),
+			RuleVersion: delivery.RuleVersion,
+			Policy:      s.overflow,
+		})
+	}
+}
+
+func gapReason(code string) string {
+	switch code {
+	case "subscriber_buffer_evicted":
+		return "policy keep_newest evicted the oldest buffered message"
+	default:
+		return "subscriber did not accept delivery without blocking; buffered or handoff messages were retained"
 	}
 }
 
@@ -644,6 +819,7 @@ func (r *Router) Publish(message Message) error {
 		}
 		target.entry.inFlight.Done()
 	}
+	r.persist()
 	return nil
 }
 
@@ -683,6 +859,10 @@ func (r *Router) Unsubscribe(id string) error {
 			RuleVersion:    delivery.RuleVersion,
 		})
 	}
+	// The cancelled subscription is gone from the router, so persisting
+	// now drops it from the state file as well: a restart cannot revive
+	// it, and a same-name resubscribe starts from a clean slate.
+	r.persist()
 	return nil
 }
 
@@ -715,8 +895,8 @@ func (r *Router) Pause(id string) error {
 		return err
 	}
 	entry.mu.Lock()
-	defer entry.mu.Unlock()
 	if entry.paused {
+		entry.mu.Unlock()
 		err := fmt.Errorf("%w: %s", ErrSubscriptionPaused, id)
 		r.addRecord(Record{
 			Kind:           RecordRejected,
@@ -728,6 +908,8 @@ func (r *Router) Pause(id string) error {
 	}
 	entry.paused = true
 	entry.signal()
+	entry.mu.Unlock()
+	r.persist()
 	return nil
 }
 
@@ -760,8 +942,8 @@ func (r *Router) Resume(id string) (ResumeReport, error) {
 		return ResumeReport{}, err
 	}
 	entry.mu.Lock()
-	defer entry.mu.Unlock()
 	if !entry.paused {
+		entry.mu.Unlock()
 		err := fmt.Errorf("%w: %s", ErrSubscriptionNotPaused, id)
 		r.addRecord(Record{
 			Kind:           RecordRejected,
@@ -779,10 +961,15 @@ func (r *Router) Resume(id string) (ResumeReport, error) {
 		report.Replayable = append(report.Replayable,
 			entry.queued[(entry.head+index)%len(entry.queued)].Message.id)
 	}
-	report.Evicted = append([]string(nil), entry.pausedDrops...)
-	entry.pausedDrops = nil
+	for _, gap := range entry.gaps {
+		report.Evicted = append(report.Evicted, gap.MessageID)
+		report.Gaps = append(report.Gaps, copyGap(gap))
+	}
+	entry.gaps = nil
 	entry.paused = false
 	entry.signal()
+	entry.mu.Unlock()
+	r.persist()
 	return report, nil
 }
 

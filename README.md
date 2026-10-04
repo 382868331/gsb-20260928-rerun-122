@@ -88,6 +88,16 @@ go run ./examples/demo
 
 暂停、取消与 `SetOverflowPolicy` 可以任意交错：暂停中切换保留策略只影响后续投递；暂停中取消则积压按取消语义放弃；已暂停的订阅不能重复暂停（`ErrSubscriptionPaused`），未暂停的订阅不能恢复（`ErrSubscriptionNotPaused`），目标不存在时两者都返回 `ErrSubscriptionGone`。
 
+## 可恢复的订阅状态
+
+`WithStateFile(path)` 让订阅状态可跨进程恢复。路由器在每次状态变化时把每个活跃订阅的规则、规则版本、溢出策略、暂停标记、**未接收**积压与暂停期间产生的缺口原子地写入状态文件（临时文件 + 重命名，崩溃不会写坏上一份状态）。用同一状态文件创建新 `Router` 即完成恢复：
+
+- `RecoveryReports()` 逐个说明恢复出的订阅：`Replayable` 是仍可补发的消息 ID（按交付顺序），`Gaps` 是已因保留约定淘汰的消息，每个缺口都保留**产生时**的原因码、文字说明、命中的规则与规则版本、以及当时的溢出策略——暂停期间切换保留约定不会改写历史缺口。
+- 已暂停的订阅恢复后仍保持暂停，`Resume` 返回的报告与恢复报告一致，补发在原有 channel 语义上进行；用 `Subscription(id)` 获取恢复订阅的消费 channel。
+- **已交给接收者的消息不会被重放**：交接完成后立即从持久化积压中移除，重开后只补发仍在队列中的消息。
+- 取消是跨重启的硬边界：`Unsubscribe` 返回后订阅即从状态文件移除，重开不会复活它；同名重新订阅是全新订阅（规则版本回到 1），不继承旧积压。
+- 恢复出的订阅保留原规则版本与溢出策略，后续发布按恢复后的状态继续匹配。
+
 ## 审计记录
 
 `Records()` 返回环形审计历史（容量由 `WithHistorySize` 控制，默认 128），每条记录包含：
@@ -110,5 +120,8 @@ go run ./examples/demo
 | `Unsubscribe(id)` | 硬边界取消：未接收的积压被放弃并记录，返回后不再交付 |
 | `Pause(id)` | 暂停接收；发布照常，保留范围由该订阅自己的溢出策略决定 |
 | `Resume(id)` | 恢复交付，返回 `ResumeReport` 说明可补发内容与已淘汰缺口 |
+| `WithStateFile(path)` | 持久化订阅状态，重开后按原进度恢复 |
+| `RecoveryReports()` | 启动时恢复出的订阅报告：可补发内容与已淘汰缺口（含原因与规则） |
+| `Subscription(id)` | 获取活跃（含恢复出的）订阅的消费 channel |
 | `Records()` | 读取拒绝/丢弃/淘汰审计记录 |
 | `WithOverflowPolicy` | `KeepOldest`（默认）或 `KeepNewest` |
