@@ -47,11 +47,11 @@ func TestRoutesByTopicAndAttributes(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m3", "ignored", nil)); err != nil {
 		t.Fatal(err)
 	}
-	if err := router.Unsubscribe("alerts"); err != nil {
-		t.Fatal(err)
-	}
 
-	deliveries := drain(sub)
+	var deliveries []Delivery
+	for index := 0; index < 2; index++ {
+		deliveries = append(deliveries, <-sub.Deliveries)
+	}
 	if len(deliveries) != 2 {
 		t.Fatalf("got %d deliveries, want 2: %#v", len(deliveries), deliveries)
 	}
@@ -60,6 +60,12 @@ func TestRoutesByTopicAndAttributes(t *testing.T) {
 	}
 	if got := deliveries[1].RuleIDs; len(got) != 1 || got[0] != "all-alerts" {
 		t.Fatalf("matched rules = %v, want topic rule only", got)
+	}
+	if err := router.Unsubscribe("alerts"); err != nil {
+		t.Fatal(err)
+	}
+	if _, open := <-sub.Deliveries; open {
+		t.Fatal("delivery channel remains open after unsubscribe")
 	}
 }
 
@@ -76,28 +82,29 @@ func TestSlowSubscriberDoesNotBlockOthersAndRecordsDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fastDone := make(chan []Delivery, 1)
-	go func() {
-		fastDone <- drain(fast)
-	}()
-
 	for index := 0; index < 10; index++ {
 		if err := router.Publish(mustMessage(t, string(rune('a'+index)), "t", nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
 
+	// The fast consumer receives everything despite the slow one.
+	if got := len(receiveAll(t, fast, 10)); got != 10 {
+		t.Fatalf("fast deliveries = %d, want 10", got)
+	}
+	// The slow consumer receives exactly the oldest message; everything
+	// else was dropped while its buffer stayed full.
+	if got := <-slow.Deliveries; got.Message.ID() != "a" {
+		t.Fatalf("slow first delivery = %q, want a", got.Message.ID())
+	}
 	if err := router.Unsubscribe("fast"); err != nil {
 		t.Fatal(err)
-	}
-	if got := len(<-fastDone); got != 10 {
-		t.Fatalf("fast deliveries = %d, want 10", got)
 	}
 	if err := router.Unsubscribe("slow"); err != nil {
 		t.Fatal(err)
 	}
-	if got := drain(slow); len(got) != 1 || got[0].Message.ID() != "a" {
-		t.Fatalf("slow deliveries = %#v, want only the oldest message a", got)
+	if _, open := <-slow.Deliveries; open {
+		t.Fatal("slow channel remains open after unsubscribe")
 	}
 
 	records := router.Records()
@@ -142,13 +149,13 @@ func TestUpdateRulesAreAtomicAndRejectedInvalidInput(t *testing.T) {
 	if !errors.Is(err, ErrSubscriptionGone) {
 		t.Fatalf("missing update error = %v, want ErrSubscriptionGone", err)
 	}
+
+	delivery := <-sub.Deliveries
+	if delivery.Message.ID() != "m2" {
+		t.Fatalf("delivery = %#v, want only m2", delivery)
+	}
 	if err := router.Unsubscribe("sub"); err != nil {
 		t.Fatal(err)
-	}
-
-	deliveries := drain(sub)
-	if len(deliveries) != 1 || deliveries[0].Message.ID() != "m2" {
-		t.Fatalf("deliveries = %#v, want only m2", deliveries)
 	}
 	rejects := 0
 	for _, record := range router.Records() {
@@ -161,7 +168,11 @@ func TestUpdateRulesAreAtomicAndRejectedInvalidInput(t *testing.T) {
 	}
 }
 
-func TestUnsubscribeFinishesInFlightAndDeliversQueuedMessages(t *testing.T) {
+// Cancellation boundary: once Unsubscribe returns, the channel is already
+// closed and no queued message is ever delivered. Messages the consumer
+// received before the boundary remain valid; everything still buffered is
+// discarded and recorded with code "subscription_cancelled".
+func TestUnsubscribeDiscardsBacklogAndClosesChannel(t *testing.T) {
 	router, err := NewRouter(WithBufferSize(2))
 	if err != nil {
 		t.Fatal(err)
@@ -183,14 +194,106 @@ func TestUnsubscribeFinishesInFlightAndDeliversQueuedMessages(t *testing.T) {
 	if err := router.Publish(mustMessage(t, "m3", "t", nil)); err != nil {
 		t.Fatal(err)
 	}
-	if _, open := <-sub.Deliveries; !open {
-		t.Fatal("delivery channel closed before queued delivery")
+	if _, open := <-sub.Deliveries; open {
+		t.Fatal("delivery channel remains open after unsubscribe returned")
 	}
-	if _, open := <-sub.Deliveries; !open {
-		t.Fatal("delivery channel closed before queued delivery")
+
+	cancelled := make(map[string]bool)
+	for _, record := range router.Records() {
+		if record.Kind == RecordDropped && record.Code == "subscription_cancelled" {
+			cancelled[record.MessageID] = true
+			if record.SubscriptionID != "sub" || record.RuleVersion != 1 {
+				t.Fatalf("cancel record targets wrong subscription or version: %#v", record)
+			}
+		}
+	}
+	if !cancelled["m1"] || !cancelled["m2"] || len(cancelled) != 2 {
+		t.Fatalf("cancelled backlog = %v, want m1 and m2", cancelled)
+	}
+}
+
+// A message the consumer received before Unsubscribe is never revoked:
+// the boundary only discards what was still unreceived.
+func TestUnsubscribeKeepsAlreadyReceivedMessages(t *testing.T) {
+	router, err := NewRouter(WithBufferSize(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"m1", "m2", "m3"} {
+		if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	received := <-sub.Deliveries
+	if received.Message.ID() != "m1" {
+		t.Fatalf("received = %q, want m1", received.Message.ID())
+	}
+	if err := router.Unsubscribe("sub"); err != nil {
+		t.Fatal(err)
 	}
 	if _, open := <-sub.Deliveries; open {
 		t.Fatal("delivery channel remains open after unsubscribe")
+	}
+	// m1 was handed to the consumer and stays valid; m2/m3 were still
+	// unreceived and are accounted for as cancelled.
+	cancelled := make(map[string]bool)
+	for _, record := range router.Records() {
+		if record.Code == "subscription_cancelled" {
+			cancelled[record.MessageID] = true
+		}
+	}
+	if cancelled["m1"] {
+		t.Fatal("received message m1 must not be recorded as cancelled")
+	}
+	if !cancelled["m2"] || !cancelled["m3"] {
+		t.Fatalf("cancelled = %v, want m2 and m3", cancelled)
+	}
+}
+
+// Re-subscribing under the same ID starts a fresh subscription: the old
+// backlog is never moved into the new subscription.
+func TestResubscribeDoesNotInheritBacklog(t *testing.T) {
+	router, err := NewRouter(WithBufferSize(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"m1", "m2"} {
+		if err := router.Publish(mustMessage(t, id, "t", nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := router.Unsubscribe("sub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, open := <-first.Deliveries; open {
+		t.Fatal("old channel remains open after unsubscribe")
+	}
+
+	second, err := router.Subscribe("sub", []Rule{{ID: "topic", Topic: "t"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Publish(mustMessage(t, "m3", "t", nil)); err != nil {
+		t.Fatal(err)
+	}
+	delivery := <-second.Deliveries
+	if delivery.Message.ID() != "m3" || delivery.RuleVersion != 1 {
+		t.Fatalf("new subscription first delivery = %#v, want only m3 at version 1", delivery)
+	}
+	if err := router.Unsubscribe("sub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, open := <-second.Deliveries; open {
+		t.Fatal("new channel remains open after unsubscribe")
 	}
 }
 

@@ -9,11 +9,13 @@ import (
 )
 
 var (
-	ErrInvalidMessage      = errors.New("invalid message")
-	ErrInvalidSubscription = errors.New("invalid subscription")
-	ErrInvalidRule         = errors.New("invalid rule")
-	ErrSubscriptionExists  = errors.New("subscription already exists")
-	ErrSubscriptionGone    = errors.New("subscription not found")
+	ErrInvalidMessage        = errors.New("invalid message")
+	ErrInvalidSubscription   = errors.New("invalid subscription")
+	ErrInvalidRule           = errors.New("invalid rule")
+	ErrSubscriptionExists    = errors.New("subscription already exists")
+	ErrSubscriptionGone      = errors.New("subscription not found")
+	ErrSubscriptionPaused    = errors.New("subscription is paused")
+	ErrSubscriptionNotPaused = errors.New("subscription is not paused")
 )
 
 const (
@@ -74,6 +76,31 @@ type Delivery struct {
 	// single atomic snapshot, so this value identifies exactly which revision
 	// of the rules produced the delivery.
 	RuleVersion int
+}
+
+// Gap describes a message that matched a subscription but was discarded
+// while the subscription was paused. The sequence of Gaps in a
+// ResumeReport is the exact list of messages that can never be
+// redelivered to that subscription.
+type Gap struct {
+	MessageID string
+	// Code is the discard reason: "subscriber_buffer_full" (KeepOldest
+	// dropped the incoming message) or "subscriber_buffer_evicted"
+	// (KeepNewest evicted the oldest retained message).
+	Code        string
+	RuleIDs     []string
+	RuleVersion int
+}
+
+// ResumeReport is returned by Resume. It states, before delivery resumes,
+// exactly what the paused subscription can still supply and what was
+// discarded while it was paused.
+type ResumeReport struct {
+	// Redeliverable lists the IDs of messages still retained for this
+	// subscription, in the order they will be delivered.
+	Redeliverable []string
+	// Gaps lists every message discarded while paused, in discard order.
+	Gaps []Gap
 }
 
 // OverflowPolicy decides what happens when a slow subscriber's bounded
@@ -196,8 +223,19 @@ type subscription struct {
 	// actually received the message, so nothing was evicted).
 	reconciled *Delivery
 
+	// paused stops the pump from handing deliveries to the consumer.
+	// Offers still enter the ring under the subscription's own retention
+	// policy; anything discarded while paused is appended to pauseGaps so
+	// Resume can report the exact gaps.
+	paused    bool
+	pauseGaps []Gap
+
 	notify   chan struct{}
 	inFlight sync.WaitGroup
+	// done is closed by the pump when it has closed the deliveries
+	// channel and exited. Unsubscribe waits for it, so once Unsubscribe
+	// returns no message can ever be delivered to that subscription again.
+	done chan struct{}
 }
 
 type Router struct {
@@ -251,6 +289,7 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 	entry.version = 1
 	entry.queued = make([]Delivery, maxInt(entry.bufferSize, 1))
 	entry.notify = make(chan struct{}, 1)
+	entry.done = make(chan struct{})
 
 	r.mu.Lock()
 	if _, exists := r.subscribers[id]; exists {
@@ -286,6 +325,14 @@ func (s *subscription) pump(router *Router) {
 		if s.reconciled != nil {
 			evicted := *s.reconciled
 			s.reconciled = nil
+			if s.paused {
+				s.pauseGaps = append(s.pauseGaps, Gap{
+					MessageID:   evicted.Message.id,
+					Code:        "subscriber_buffer_evicted",
+					RuleIDs:     append([]string(nil), evicted.RuleIDs...),
+					RuleVersion: evicted.RuleVersion,
+				})
+			}
 			s.mu.Unlock()
 			router.addRecord(Record{
 				Time:           time.Now(),
@@ -300,7 +347,41 @@ func (s *subscription) pump(router *Router) {
 			})
 			continue
 		}
-		if s.pending == nil {
+		if s.closed {
+			// Cancellation boundary: every message the consumer has not
+			// received yet (in handoff or still queued) is discarded and
+			// accounted for; nothing is delivered after this point.
+			discarded := make([]Delivery, 0, s.count+1)
+			if s.pending != nil {
+				discarded = append(discarded, *s.pending)
+				s.pending = nil
+				s.gen++
+			}
+			for s.count > 0 {
+				discarded = append(discarded, s.queued[s.head])
+				s.queued[s.head] = Delivery{}
+				s.head = (s.head + 1) % len(s.queued)
+				s.count--
+			}
+			s.mu.Unlock()
+			for _, delivery := range discarded {
+				router.addRecord(Record{
+					Time:           time.Now(),
+					Kind:           RecordDropped,
+					Code:           "subscription_cancelled",
+					Reason:         "subscription cancelled before the consumer received this message; retained backlog discarded",
+					MessageID:      delivery.Message.id,
+					Topic:          delivery.Message.topic,
+					SubscriptionID: delivery.SubscriptionID,
+					RuleIDs:        append([]string(nil), delivery.RuleIDs...),
+					RuleVersion:    delivery.RuleVersion,
+				})
+			}
+			close(s.deliveries)
+			close(s.done)
+			return
+		}
+		if !s.paused && s.pending == nil {
 			if s.count > 0 {
 				delivery := s.queued[s.head]
 				s.queued[s.head] = Delivery{}
@@ -308,13 +389,12 @@ func (s *subscription) pump(router *Router) {
 				s.count--
 				s.pending = &delivery
 				s.gen++
-			} else if s.closed {
-				s.mu.Unlock()
-				close(s.deliveries)
-				return
 			}
 		}
-		delivery := s.pending
+		var delivery *Delivery
+		if !s.paused {
+			delivery = s.pending
+		}
 		gen := s.gen
 		notify := s.notify
 		s.mu.Unlock()
@@ -485,15 +565,31 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 		s.queued[s.head] = Delivery{}
 		s.head = (s.head + 1) % capacity
 		s.queued[(s.head+s.count-1)%capacity] = delivery
+		if s.paused {
+			s.pauseGaps = append(s.pauseGaps, Gap{
+				MessageID:   evicted.Message.id,
+				Code:        "subscriber_buffer_evicted",
+				RuleIDs:     append([]string(nil), evicted.RuleIDs...),
+				RuleVersion: evicted.RuleVersion,
+			})
+		}
 		s.signal()
 		return evicted, "subscriber_buffer_evicted"
 	}
 
+	if s.paused {
+		s.pauseGaps = append(s.pauseGaps, Gap{
+			MessageID:   delivery.Message.id,
+			Code:        "subscriber_buffer_full",
+			RuleIDs:     append([]string(nil), delivery.RuleIDs...),
+			RuleVersion: delivery.RuleVersion,
+		})
+	}
 	return delivery, "subscriber_buffer_full"
 }
 
-// close marks the subscription closed; the pump finishes sending every
-// queued message and then closes the consumer channel.
+// close marks the subscription closed; the pump discards every unreceived
+// message (recording each one), closes the consumer channel, and exits.
 func (s *subscription) close() {
 	s.mu.Lock()
 	s.closed = true
@@ -582,10 +678,16 @@ func (r *Router) Publish(message Message) error {
 	return nil
 }
 
-// Unsubscribe prevents new deliveries and waits for in-flight offers to
-// finish. It then marks the subscription closed: every message already
-// accepted into the bounded buffer (the drain backlog) is still delivered
-// to the consumer in order, followed by channel close.
+// Unsubscribe prevents new deliveries, waits for in-flight offers to
+// finish, and then enforces the cancellation boundary: every message the
+// consumer has not received yet (in handoff or still buffered) is
+// discarded and recorded with code "subscription_cancelled", the
+// deliveries channel is closed, and the pump exits before Unsubscribe
+// returns. After Unsubscribe returns, no message is ever delivered to
+// this subscription again. Messages the consumer already received remain
+// theirs; the router never revokes or reclaims them. Other subscriptions
+// are unaffected, and a later Subscribe with the same ID starts a fresh
+// subscription that never inherits the old backlog.
 func (r *Router) Unsubscribe(id string) error {
 	r.mu.Lock()
 	entry, ok := r.subscribers[id]
@@ -598,7 +700,118 @@ func (r *Router) Unsubscribe(id string) error {
 
 	entry.inFlight.Wait()
 	entry.close()
+	<-entry.done
 	return nil
+}
+
+// Pause stops deliveries to the consumer without cancelling the
+// subscription. While paused, matching messages are still accepted into
+// the subscription's bounded buffer under its own overflow policy
+// (Publish never blocks on a paused subscriber), and anything the
+// retention policy discards is remembered as a gap for Resume to report.
+// Pausing an already paused subscription returns ErrSubscriptionPaused.
+func (r *Router) Pause(id string) error {
+	if id == "" {
+		err := fmt.Errorf("%w: subscription id is required", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "invalid_subscription",
+			Reason: err.Error(),
+		})
+		return err
+	}
+
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_gone",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return err
+	}
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.paused {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionPaused, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_already_paused",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return err
+	}
+	entry.paused = true
+	entry.pauseGaps = nil
+	entry.signal()
+	return nil
+}
+
+// Resume restarts deliveries to a paused consumer and reports, before any
+// further delivery, exactly what the subscription can still supply and
+// what was discarded while it was paused: Redeliverable lists the retained
+// message IDs in upcoming delivery order, and Gaps lists every message
+// the retention policy discarded during the pause. Delivery of the
+// redeliverable backlog starts after Resume returns. Resuming a
+// subscription that is not paused returns ErrSubscriptionNotPaused.
+func (r *Router) Resume(id string) (ResumeReport, error) {
+	if id == "" {
+		err := fmt.Errorf("%w: subscription id is required", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "invalid_subscription",
+			Reason: err.Error(),
+		})
+		return ResumeReport{}, err
+	}
+
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_gone",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return ResumeReport{}, err
+	}
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if !entry.paused {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionNotPaused, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_not_paused",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return ResumeReport{}, err
+	}
+
+	report := ResumeReport{}
+	if entry.pending != nil {
+		report.Redeliverable = append(report.Redeliverable, entry.pending.Message.id)
+	}
+	for index := 0; index < entry.count; index++ {
+		delivery := entry.queued[(entry.head+index)%len(entry.queued)]
+		report.Redeliverable = append(report.Redeliverable, delivery.Message.id)
+	}
+	report.Gaps = append(report.Gaps, entry.pauseGaps...)
+
+	entry.pauseGaps = nil
+	entry.paused = false
+	entry.signal()
+	return report, nil
 }
 
 func (r *Router) Records() []Record {
