@@ -177,6 +177,16 @@ type ResumeReport struct {
 	SubscriptionID string
 	Replayable     []string
 	Evicted        []string
+	Gaps           []ResumeGap
+}
+
+// ResumeGap describes one message that cannot be replayed because the
+// retention convention in effect when it was discarded removed it. The
+// delivery retains the message and the exact matching rule snapshot.
+type ResumeGap struct {
+	Delivery Delivery
+	Code     string
+	Reason   string
 }
 
 type subscription struct {
@@ -207,18 +217,26 @@ type subscription struct {
 	// pump might concurrently complete its send. The pump either records
 	// the eviction (the send lost the race) or drops it (the consumer
 	// actually received the message, so nothing was evicted).
-	reconciled *Delivery
+	reconciled *ResumeGap
 
 	// paused stops the pump from handing deliveries to the consumer.
 	// Offers still enter the bounded buffer and the retention policy
 	// keeps applying while paused.
 	paused bool
-	// pausedDrops accumulates the IDs of messages dropped or evicted
-	// while paused; Resume reports them as the replay gaps.
-	pausedDrops []string
+	// stopping pauses new handoffs at an orderly Close without marking the
+	// subscription cancelled in durable state.
+	stopping bool
+	// pausedDrops accumulates messages dropped or evicted while paused;
+	// Resume reports them as immutable replay gaps.
+	pausedDrops []ResumeGap
+
+	seq      int64
+	instance string
+	canceled bool
 
 	notify   chan struct{}
 	inFlight sync.WaitGroup
+	flushed  sync.WaitGroup
 	// done is closed when the pump goroutine exits; Unsubscribe waits
 	// for it so no delivery can be sent after cancellation returns.
 	done chan struct{}
@@ -237,6 +255,11 @@ type Router struct {
 	auditMu   sync.Mutex
 	history   []Record
 	nextAudit int
+
+	statePath string
+	stateMu   sync.Mutex
+	storeSeq  map[string]int64
+	restored  map[string]*subscription
 }
 
 func NewRouter(options ...Option) (*Router, error) {
@@ -247,6 +270,11 @@ func NewRouter(options ...Option) (*Router, error) {
 	}
 	for _, option := range options {
 		if err := option(r); err != nil {
+			return nil, err
+		}
+	}
+	if r.statePath != "" {
+		if err := r.loadState(); err != nil {
 			return nil, err
 		}
 	}
@@ -266,6 +294,7 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 		id:         id,
 		bufferSize: r.bufferSize,
 		overflow:   KeepOldest,
+		instance:   newInstanceID(),
 	}
 	for _, option := range options {
 		if err := option(entry); err != nil {
@@ -286,8 +315,22 @@ func (r *Router) Subscribe(id string, rules []Rule, options ...SubscribeOption) 
 		r.mu.Unlock()
 		return Subscription{}, fmt.Errorf("%w: %s", ErrSubscriptionExists, id)
 	}
+	if state, exists := r.restored[id]; exists && !state.canceled {
+		r.mu.Unlock()
+		return Subscription{}, fmt.Errorf("%w: %s; restore it after reopening the router", ErrSubscriptionExists, id)
+	} else if exists {
+		delete(r.restored, id)
+	}
 	r.subscribers[id] = entry
 	r.mu.Unlock()
+	if err := r.persist(entry); err != nil {
+		r.mu.Lock()
+		delete(r.subscribers, id)
+		r.mu.Unlock()
+		entry.close()
+		<-entry.done
+		return Subscription{}, err
+	}
 
 	go entry.pump(r)
 
@@ -313,6 +356,21 @@ func (s *subscription) pump(router *Router) {
 	defer close(s.done)
 	for {
 		s.mu.Lock()
+		if s.stopping && s.pending != nil {
+			capacity := len(s.queued)
+			s.head = (s.head - 1 + capacity) % capacity
+			s.queued[s.head] = *s.pending
+			s.count++
+			s.pending = nil
+			s.gen++
+			state := router.snapshotSubscription(s)
+			s.mu.Unlock()
+			if err := router.writeState(state); err != nil {
+				router.addRecord(Record{Kind: RecordRejected, Code: "state_write_failed", Reason: err.Error(), SubscriptionID: s.id})
+			}
+			s.flushed.Done()
+			continue
+		}
 		if s.reconciled != nil {
 			evicted := *s.reconciled
 			s.reconciled = nil
@@ -320,13 +378,13 @@ func (s *subscription) pump(router *Router) {
 			router.addRecord(Record{
 				Time:           time.Now(),
 				Kind:           RecordDropped,
-				Code:           "subscriber_buffer_evicted",
-				Reason:         "policy keep_newest evicted the oldest buffered message",
-				MessageID:      evicted.Message.id,
-				Topic:          evicted.Message.topic,
-				SubscriptionID: evicted.SubscriptionID,
-				RuleIDs:        append([]string(nil), evicted.RuleIDs...),
-				RuleVersion:    evicted.RuleVersion,
+				Code:           evicted.Code,
+				Reason:         evicted.Reason,
+				MessageID:      evicted.Delivery.Message.id,
+				Topic:          evicted.Delivery.Message.topic,
+				SubscriptionID: evicted.Delivery.SubscriptionID,
+				RuleIDs:        append([]string(nil), evicted.Delivery.RuleIDs...),
+				RuleVersion:    evicted.Delivery.RuleVersion,
 			})
 			continue
 		}
@@ -338,6 +396,7 @@ func (s *subscription) pump(router *Router) {
 			if s.pending != nil {
 				s.discarded = append(s.discarded, *s.pending)
 				s.pending = nil
+				s.flushed.Done()
 			}
 			for index := 0; index < s.count; index++ {
 				s.discarded = append(s.discarded, s.queued[(s.head+index)%len(s.queued)])
@@ -355,7 +414,7 @@ func (s *subscription) pump(router *Router) {
 			<-notify
 			continue
 		}
-		if s.pending == nil {
+		if s.pending == nil && !s.stopping {
 			if s.count > 0 {
 				delivery := s.queued[s.head]
 				s.queued[s.head] = Delivery{}
@@ -363,6 +422,7 @@ func (s *subscription) pump(router *Router) {
 				s.count--
 				s.pending = &delivery
 				s.gen++
+				s.flushed.Add(1)
 			}
 		}
 		delivery := s.pending
@@ -381,14 +441,22 @@ func (s *subscription) pump(router *Router) {
 			if s.gen == gen {
 				s.pending = nil
 				s.gen++
+				state := router.snapshotSubscription(s)
+				s.mu.Unlock()
+				_ = router.writeState(state)
+				s.flushed.Done()
 			} else {
 				// The consumer received a delivery that offer had
 				// already evicted from pending. Received messages are
 				// no longer subject to the retention policy, so the
 				// eviction simply never happened.
 				s.reconciled = nil
+				s.removePausedDrop(delivery.Message.id)
+				state := router.snapshotSubscription(s)
+				s.mu.Unlock()
+				_ = router.writeState(state)
+				s.flushed.Done()
 			}
-			s.mu.Unlock()
 		case <-notify:
 			// State changed (arrival, eviction, or close); re-read
 			// under the lock before retrying the handoff.
@@ -433,8 +501,12 @@ func (r *Router) UpdateRules(subscriptionID string, rules []Rule) error {
 	entry.mu.Lock()
 	entry.rules = prepared
 	entry.version++
+	state := r.snapshotSubscription(entry)
 	entry.mu.Unlock()
 	r.mu.Unlock()
+	if err := r.writeState(state); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -483,7 +555,11 @@ func (r *Router) SetOverflowPolicy(subscriptionID string, policy OverflowPolicy)
 	}
 	entry.mu.Lock()
 	entry.overflow = policy
+	state := r.snapshotSubscription(entry)
 	entry.mu.Unlock()
+	if err := r.writeState(state); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -497,11 +573,11 @@ func (r *Router) SetOverflowPolicy(subscriptionID string, policy OverflowPolicy)
 // at most bufferSize messages. KeepOldest drops the incoming delivery when
 // full; KeepNewest evicts the oldest unreceived delivery, which is the
 // pending handoff when one exists.
-func (s *subscription) offer(delivery Delivery) (Delivery, string) {
+func (s *subscription) offer(delivery Delivery) (Delivery, string, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
-		return delivery, "subscriber_buffer_full"
+		s.mu.Unlock()
+		return delivery, "subscriber_buffer_full", false
 	}
 
 	occupied := s.count
@@ -513,7 +589,9 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 		s.queued[(s.head+s.count)%capacity] = delivery
 		s.count++
 		s.signal()
-		return Delivery{}, ""
+		changed := true
+		s.mu.Unlock()
+		return Delivery{}, "", changed
 	}
 
 	if s.overflow == KeepNewest && s.bufferSize > 0 {
@@ -524,33 +602,68 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 			evicted := *s.pending
 			s.pending = nil
 			s.gen++
-			s.reconciled = &evicted
-			s.notePausedDrop(evicted.Message.id)
+			gap := newResumeGap(evicted)
+			s.reconciled = &gap
+			s.notePausedDrop(gap)
+			s.flushed.Done()
 			capacity := len(s.queued)
 			s.queued[(s.head+s.count)%capacity] = delivery
 			s.count++
 			s.signal()
-			return Delivery{}, ""
+			changed := true
+			s.mu.Unlock()
+			return Delivery{}, "", changed
 		}
 		capacity := len(s.queued)
 		evicted := s.queued[s.head]
 		s.queued[s.head] = Delivery{}
 		s.head = (s.head + 1) % capacity
 		s.queued[(s.head+s.count-1)%capacity] = delivery
-		s.notePausedDrop(evicted.Message.id)
+		gap := newResumeGap(evicted)
+		s.notePausedDrop(gap)
 		s.signal()
-		return evicted, "subscriber_buffer_evicted"
+		changed := true
+		s.mu.Unlock()
+		return evicted, "subscriber_buffer_evicted", changed
 	}
 
-	s.notePausedDrop(delivery.Message.id)
-	return delivery, "subscriber_buffer_full"
+	gap := ResumeGap{
+		Delivery: delivery,
+		Code:     "subscriber_buffer_full",
+		Reason:   "policy keep_oldest dropped the new message while the buffer was full",
+	}
+	s.notePausedDrop(gap)
+	changed := s.paused
+	s.mu.Unlock()
+	return delivery, "subscriber_buffer_full", changed
 }
 
 // notePausedDrop remembers a message discarded while the subscription is
 // paused so Resume can report the exact replay gap. Callers hold s.mu.
-func (s *subscription) notePausedDrop(messageID string) {
+func newResumeGap(delivery Delivery) ResumeGap {
+	return ResumeGap{
+		Delivery: delivery,
+		Code:     "subscriber_buffer_evicted",
+		Reason:   "policy keep_newest evicted the oldest buffered message",
+	}
+}
+
+func (s *subscription) notePausedDrop(gap ResumeGap) {
 	if s.paused {
-		s.pausedDrops = append(s.pausedDrops, messageID)
+		if gap.Code == "subscriber_buffer_full" {
+			gap.Code = "subscriber_buffer_full"
+			gap.Reason = "policy keep_oldest dropped the new message while the buffer was full"
+		}
+		s.pausedDrops = append(s.pausedDrops, gap)
+	}
+}
+
+func (s *subscription) removePausedDrop(messageID string) {
+	for index, gap := range s.pausedDrops {
+		if gap.Delivery.Message.id == messageID {
+			s.pausedDrops = append(s.pausedDrops[:index], s.pausedDrops[index+1:]...)
+			return
+		}
 	}
 }
 
@@ -614,7 +727,18 @@ func (r *Router) Publish(message Message) error {
 			RuleIDs:        target.ruleIDs,
 			RuleVersion:    target.version,
 		}
-		discarded, code := target.entry.offer(delivery)
+		discarded, code, changed := target.entry.offer(delivery)
+		if changed {
+			if err := r.persist(target.entry); err != nil {
+				target.entry.mu.Lock()
+				target.entry.stopping = true
+				target.entry.signal()
+				target.entry.mu.Unlock()
+				target.entry.flushed.Wait()
+				target.entry.inFlight.Done()
+				return err
+			}
+		}
 		switch code {
 		case "":
 		case "subscriber_buffer_full":
@@ -622,7 +746,7 @@ func (r *Router) Publish(message Message) error {
 				Time:           time.Now(),
 				Kind:           RecordDropped,
 				Code:           "subscriber_buffer_full",
-				Reason:         "subscriber did not accept delivery without blocking; buffered or handoff messages were retained",
+				Reason:         "policy keep_oldest dropped the new message while the buffer was full",
 				MessageID:      message.id,
 				Topic:          message.topic,
 				SubscriptionID: target.entry.id,
@@ -683,6 +807,9 @@ func (r *Router) Unsubscribe(id string) error {
 			RuleVersion:    delivery.RuleVersion,
 		})
 	}
+	if err := r.persist(entry); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -715,8 +842,8 @@ func (r *Router) Pause(id string) error {
 		return err
 	}
 	entry.mu.Lock()
-	defer entry.mu.Unlock()
 	if entry.paused {
+		entry.mu.Unlock()
 		err := fmt.Errorf("%w: %s", ErrSubscriptionPaused, id)
 		r.addRecord(Record{
 			Kind:           RecordRejected,
@@ -728,6 +855,11 @@ func (r *Router) Pause(id string) error {
 	}
 	entry.paused = true
 	entry.signal()
+	state := r.snapshotSubscription(entry)
+	entry.mu.Unlock()
+	if err := r.writeState(state); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -760,8 +892,8 @@ func (r *Router) Resume(id string) (ResumeReport, error) {
 		return ResumeReport{}, err
 	}
 	entry.mu.Lock()
-	defer entry.mu.Unlock()
 	if !entry.paused {
+		entry.mu.Unlock()
 		err := fmt.Errorf("%w: %s", ErrSubscriptionNotPaused, id)
 		r.addRecord(Record{
 			Kind:           RecordRejected,
@@ -779,10 +911,18 @@ func (r *Router) Resume(id string) (ResumeReport, error) {
 		report.Replayable = append(report.Replayable,
 			entry.queued[(entry.head+index)%len(entry.queued)].Message.id)
 	}
-	report.Evicted = append([]string(nil), entry.pausedDrops...)
+	report.Gaps = append([]ResumeGap(nil), entry.pausedDrops...)
+	for _, gap := range report.Gaps {
+		report.Evicted = append(report.Evicted, gap.Delivery.Message.id)
+	}
 	entry.pausedDrops = nil
 	entry.paused = false
 	entry.signal()
+	state := r.snapshotSubscription(entry)
+	entry.mu.Unlock()
+	if err := r.writeState(state); err != nil {
+		return ResumeReport{}, err
+	}
 	return report, nil
 }
 

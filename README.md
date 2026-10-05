@@ -88,6 +88,24 @@ go run ./examples/demo
 
 暂停、取消与 `SetOverflowPolicy` 可以任意交错：暂停中切换保留策略只影响后续投递；暂停中取消则积压按取消语义放弃；已暂停的订阅不能重复暂停（`ErrSubscriptionPaused`），未暂停的订阅不能恢复（`ErrSubscriptionNotPaused`），目标不存在时两者都返回 `ErrSubscriptionGone`。
 
+## 进程重开后的可恢复状态
+
+默认路由器仍是纯内存对象；若需要跨进程恢复，使用 `WithStateFile(path)`。路由器会把每个订阅实例的完整状态追加为 JSONL 快照事件：
+
+- 订阅规则与规则版本、缓冲容量、当前溢出策略、暂停状态；
+- 尚未交给接收者的消息队列，恢复后仍按原顺序补发；
+- 暂停期间已经淘汰的缺口；每个缺口保留消息本体、命中的规则 ID、规则版本、淘汰原因码与文字原因；
+- 已取消订阅的持久墓碑，以及同名新订阅的独立实例 ID。
+
+重开进程后用 `NewRouter(WithStateFile(path))` 打开同一状态文件，再调用：
+
+- `Restore(id)`：恢复单个订阅并重新绑定消费 channel；暂停订阅会继续保持暂停；活动订阅会继续发送未接收队列。
+- `RestoreAll()`：恢复所有未取消订阅。
+- `Resume(id)`：对恢复后仍暂停的订阅获取报告；`Replayable` 列出仍可补发的消息，`Evicted` 是兼容的消息 ID 列表，`Gaps` 提供完整原因和匹配规则。
+- `Close()`：有序重开边界，等待已接受的状态变化刷到状态文件；它不会取消订阅，也不会要求慢接收者取走当前交接消息。该消息会作为“尚未接收”保留并在重开后补发。
+
+暂停期间切换保留策略只会影响切换之后的新缺口。历史缺口在产生时已经记录了当时的约定和匹配快照，之后再改策略不会重写它们。取消完成后，旧订阅不能通过 `Restore` 复活；之后用同名 `Subscribe` 会得到新的订阅实例，规则版本重新从 1 开始，旧积压不会迁移。
+
 ## 审计记录
 
 `Records()` 返回环形审计历史（容量由 `WithHistorySize` 控制，默认 128），每条记录包含：
@@ -103,6 +121,9 @@ go run ./examples/demo
 | --- | --- |
 | `NewMessage(id, topic, attrs)` | 构造不可变消息，属性会被复制 |
 | `NewRouter(opts...)` | 创建路由器（`WithBufferSize`、`WithHistorySize`） |
+| `WithStateFile(path)` | 启用 JSONL 持久化，支持重开后恢复订阅与未接收队列 |
+| `Restore(id)` / `RestoreAll()` | 重开后重新绑定一个或全部未取消订阅 |
+| `Close()` | 有序刷盘，准备进程重开；不取消订阅 |
 | `Subscribe(id, rules, opts...)` | 订阅，规则版本从 1 开始；返回消费 channel |
 | `UpdateRules(id, rules)` | 原子替换规则集，成功后版本加 1 |
 | `SetOverflowPolicy(id, policy)` | 运行中切换溢出策略；积压保留，新策略对后续投递生效 |
