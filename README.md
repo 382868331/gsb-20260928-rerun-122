@@ -98,6 +98,18 @@ go run ./examples/demo
 - 取消是跨重启的硬边界：`Unsubscribe` 返回后订阅即从状态文件移除，重开不会复活它；同名重新订阅是全新订阅（规则版本回到 1），不继承旧积压。
 - 恢复出的订阅保留原规则版本与溢出策略，后续发布按恢复后的状态继续匹配。
 
+
+## 恢复前的范围选择
+
+恢复交付前可以先查看、再选择，而不是无条件全量补发：
+
+- `PendingRecovery(id)` 是只读预览：列出仍可补发的消息（按交付顺序）与暂停期间已产生的缺口，**不会**恢复交付，也不会把任何消息标记为已交付；可以反复查看。
+- `ResumeSelective(id, sel)` 确认一次选择并恢复交付：`RecoverySelection` 可按规则 ID（`RuleIDs`）与入队时间范围（`Since`/`Until`）过滤要补发的消息；其余积压由 `Remainder` 决定——`RemainderKeepPending`（默认）保留为待处理、恢复后按原顺序继续交付，`RemainderAbandon` 则由用户明确放弃，此时必须给出 `Reason`。
+- 选择只绑定确认那一刻看到的积压快照：确认之后到达的消息按订阅当前的匹配与保留约定正常处理，不会被早先的选择条件波及。
+- 选择本身不把消息标记为已交付：补发仍走原有的 pump 交接语义，只有消费者真正接收后才从积压中移除。
+- 每次确认都记录为一条 `RecoveryDecision`（补发了什么、保留了什么、放弃了什么及理由），随订阅状态持久化；重开后通过 `RecoveryDecisions(id)` 或恢复报告的 `Decisions` 字段仍可区分“保留约定淘汰的缺口”与“人工放弃”（后者的缺口与审计记录使用 `recovery_abandoned` 原因码并携带用户理由）。
+- 决策日志属于订阅实例：取消旧订阅后建立同名订阅是全新实例，先前的恢复选择不会作用到它。
+
 ## 审计记录
 
 `Records()` 返回环形审计历史（容量由 `WithHistorySize` 控制，默认 128），每条记录包含：
@@ -120,6 +132,9 @@ go run ./examples/demo
 | `Unsubscribe(id)` | 硬边界取消：未接收的积压被放弃并记录，返回后不再交付 |
 | `Pause(id)` | 暂停接收；发布照常，保留范围由该订阅自己的溢出策略决定 |
 | `Resume(id)` | 恢复交付，返回 `ResumeReport` 说明可补发内容与已淘汰缺口 |
+| `PendingRecovery(id)` | 只读预览可补发内容与缺口，不改变任何状态 |
+| `ResumeSelective(id, sel)` | 按规则/时间范围确认恢复选择，其余积压保留待处理或带理由放弃 |
+| `RecoveryDecisions(id)` | 读取该订阅实例已确认的恢复选择日志 |
 | `WithStateFile(path)` | 持久化订阅状态，重开后按原进度恢复 |
 | `RecoveryReports()` | 启动时恢复出的订阅报告：可补发内容与已淘汰缺口（含原因与规则） |
 | `Subscription(id)` | 获取活跃（含恢复出的）订阅的消费 channel |

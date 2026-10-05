@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 // Gap describes a message the retention policy discarded while the
@@ -45,6 +46,10 @@ type RecoveryReport struct {
 	// Gaps lists the messages the retention policy discarded while the
 	// subscription was paused, with the reason and rules at gap time.
 	Gaps []Gap
+	// Decisions replays the recovery selections confirmed before the
+	// restart, so deliberate abandonments stay distinguishable from
+	// retention gaps.
+	Decisions []RecoveryDecision
 }
 
 // persistedMessage is the serializable form of Message.
@@ -58,6 +63,7 @@ type persistedDelivery struct {
 	Message     persistedMessage `json:"message"`
 	RuleIDs     []string         `json:"rule_ids,omitempty"`
 	RuleVersion int              `json:"rule_version"`
+	EnqueuedAt  time.Time        `json:"enqueued_at,omitempty"`
 }
 
 type persistedSubscription struct {
@@ -69,6 +75,7 @@ type persistedSubscription struct {
 	Paused     bool                `json:"paused"`
 	Backlog    []persistedDelivery `json:"backlog,omitempty"`
 	Gaps       []Gap               `json:"gaps,omitempty"`
+	Decisions  []RecoveryDecision  `json:"decisions,omitempty"`
 }
 
 type persistedState struct {
@@ -96,6 +103,7 @@ func persistDelivery(delivery Delivery) persistedDelivery {
 		Message:     persistMessage(delivery.Message),
 		RuleIDs:     append([]string(nil), delivery.RuleIDs...),
 		RuleVersion: delivery.RuleVersion,
+		EnqueuedAt:  delivery.enqueuedAt,
 	}
 }
 
@@ -105,6 +113,7 @@ func restoreDelivery(subscriptionID string, delivery persistedDelivery) Delivery
 		SubscriptionID: subscriptionID,
 		RuleIDs:        append([]string(nil), delivery.RuleIDs...),
 		RuleVersion:    delivery.RuleVersion,
+		enqueuedAt:     delivery.EnqueuedAt,
 	}
 }
 

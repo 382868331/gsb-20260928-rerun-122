@@ -76,6 +76,10 @@ type Delivery struct {
 	// single atomic snapshot, so this value identifies exactly which revision
 	// of the rules produced the delivery.
 	RuleVersion int
+	// enqueuedAt records when the router accepted this delivery into the
+	// subscription's backlog; recovery selections use it for time-range
+	// filtering.
+	enqueuedAt time.Time
 }
 
 // OverflowPolicy decides what happens when a slow subscriber's bounded
@@ -198,6 +202,63 @@ type ResumeReport struct {
 	// Gaps details every evicted message with the reason, the matched
 	// rules, and the retention policy in effect when the gap was created.
 	Gaps []Gap
+	// Abandoned lists the messages a recovery selection explicitly gave
+	// up; their reasons live in Gaps with code "recovery_abandoned".
+	Abandoned []string
+}
+
+// RemainderPolicy decides what happens to the backlog a recovery
+// selection did not select.
+type RemainderPolicy string
+
+const (
+	// RemainderKeepPending leaves unselected messages in the backlog;
+	// they are delivered in order after the subscription resumes.
+	RemainderKeepPending RemainderPolicy = "keep_pending"
+	// RemainderAbandon drops unselected messages with the caller's
+	// reason, recorded as gaps with code "recovery_abandoned".
+	RemainderAbandon RemainderPolicy = "abandon"
+)
+
+// RecoverySelection chooses which messages of the paused backlog to
+// replay. An empty RuleIDs matches every rule; zero Since/Until leave
+// the corresponding time bound open. The selection is evaluated against
+// the backlog as it stands when ResumeSelective runs; messages that
+// arrive afterwards are handled by the subscription's normal rules and
+// are never affected by an earlier selection.
+type RecoverySelection struct {
+	// RuleIDs limits replay to deliveries that matched any of these
+	// rules; empty means no rule filter.
+	RuleIDs []string
+	// Since and Until bound the enqueue time of replayed messages.
+	Since time.Time
+	Until time.Time
+	// Remainder decides the fate of unselected backlog messages;
+	// the zero value keeps them pending.
+	Remainder RemainderPolicy
+	// Reason is required when Remainder is RemainderAbandon: it is
+	// stored with every abandoned message so a later restart can tell
+	// a deliberate abandonment apart from a retention gap.
+	Reason string
+}
+
+// RecoveryDecision records one confirmed recovery selection: what was
+// replayed, what stayed pending, and what was abandoned with which
+// reason. Decisions are persisted with the subscription and survive
+// restarts, but they belong to the subscription instance: cancelling
+// and resubscribing under the same name starts with an empty log.
+type RecoveryDecision struct {
+	Time           time.Time
+	SubscriptionID string
+	Selection      RecoverySelection
+	// Replayed lists the message IDs the selection chose for replay.
+	Replayed []string
+	// KeptPending lists the unselected messages left in the backlog.
+	KeptPending []string
+	// Abandoned lists the messages the user explicitly gave up.
+	Abandoned []string
+	// Reason is the user-supplied abandonment reason.
+	Reason string
 }
 
 type subscription struct {
@@ -238,6 +299,10 @@ type subscription struct {
 	// with the reason, matched rules, and policy at gap time; Resume
 	// reports them as the replay gaps.
 	gaps []Gap
+	// decisions logs every confirmed recovery selection so a restart
+	// can still explain which messages were replayed, kept pending, or
+	// deliberately abandoned, and why.
+	decisions []RecoveryDecision
 
 	notify   chan struct{}
 	inFlight sync.WaitGroup
@@ -318,6 +383,8 @@ func (r *Router) recover() error {
 			entry.gaps = append(entry.gaps, copyGap(gap))
 			report.Gaps = append(report.Gaps, copyGap(gap))
 		}
+		entry.decisions = append(entry.decisions, persisted.Decisions...)
+		report.Decisions = append(report.Decisions, persisted.Decisions...)
 		r.subscribers[persisted.ID] = entry
 		r.recovered = append(r.recovered, report)
 		go entry.pump(r)
@@ -389,6 +456,7 @@ func (r *Router) persist() {
 		for _, gap := range entry.gaps {
 			persisted.Gaps = append(persisted.Gaps, copyGap(gap))
 		}
+		persisted.Decisions = append(persisted.Decisions, entry.decisions...)
 		entry.mu.Unlock()
 		state.Subscriptions = append(state.Subscriptions, persisted)
 	}
@@ -658,6 +726,7 @@ func (s *subscription) offer(delivery Delivery) (Delivery, string) {
 	if s.closed {
 		return delivery, "subscriber_buffer_full"
 	}
+	delivery.enqueuedAt = time.Now()
 
 	occupied := s.count
 	if s.pending != nil {
@@ -971,6 +1040,285 @@ func (r *Router) Resume(id string) (ResumeReport, error) {
 	entry.mu.Unlock()
 	r.persist()
 	return report, nil
+}
+
+// backlogLocked lists every unreceived delivery in the order the pump
+// will hand them to the consumer: the in-flight handoff first, then the
+// ring. Callers hold s.mu.
+func (s *subscription) backlogLocked() []Delivery {
+	var backlog []Delivery
+	if s.pending != nil {
+		backlog = append(backlog, *s.pending)
+	}
+	for index := 0; index < s.count; index++ {
+		backlog = append(backlog, s.queued[(s.head+index)%len(s.queued)])
+	}
+	return backlog
+}
+
+// reportLocked describes the current backlog and pause-time gaps without
+// changing any state. Callers hold s.mu.
+func (s *subscription) reportLocked() ResumeReport {
+	report := ResumeReport{SubscriptionID: s.id}
+	for _, delivery := range s.backlogLocked() {
+		report.Replayable = append(report.Replayable, delivery.Message.id)
+	}
+	for _, gap := range s.gaps {
+		report.Evicted = append(report.Evicted, gap.MessageID)
+		report.Gaps = append(report.Gaps, copyGap(gap))
+	}
+	return report
+}
+
+// PendingRecovery previews what a paused subscription could still replay
+// and which gaps already exist, without resuming delivery and without
+// marking anything as delivered. It is the read-only half of the
+// recovery-selection flow: inspect first, then confirm with
+// ResumeSelective. The preview is a snapshot; messages arriving
+// afterwards are not covered by it.
+func (r *Router) PendingRecovery(id string) (ResumeReport, error) {
+	entry, err := r.pausedSubscription(id)
+	if err != nil {
+		return ResumeReport{}, err
+	}
+	entry.mu.Lock()
+	report := entry.reportLocked()
+	entry.mu.Unlock()
+	return report, nil
+}
+
+// pausedSubscription resolves an id to a paused subscription, recording
+// the same audit entries as the other paused-only operations.
+func (r *Router) pausedSubscription(id string) (*subscription, error) {
+	if id == "" {
+		err := fmt.Errorf("%w: subscription id is required", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:   RecordRejected,
+			Code:   "invalid_subscription",
+			Reason: err.Error(),
+		})
+		return nil, err
+	}
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionGone, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_gone",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return nil, err
+	}
+	entry.mu.Lock()
+	paused := entry.paused
+	entry.mu.Unlock()
+	if !paused {
+		err := fmt.Errorf("%w: %s", ErrSubscriptionNotPaused, id)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "subscription_not_paused",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return nil, err
+	}
+	return entry, nil
+}
+
+// selected reports whether a backlog delivery belongs to the recovery
+// selection: it matched at least one of the selected rules (or no rule
+// filter was given) and its enqueue time falls inside the optional
+// range. Deliveries restored from an older state file may carry no
+// enqueue time; they always satisfy the time filter.
+func (sel RecoverySelection) selected(delivery Delivery) bool {
+	if len(sel.RuleIDs) > 0 {
+		matched := false
+		for _, ruleID := range delivery.RuleIDs {
+			for _, wanted := range sel.RuleIDs {
+				if ruleID == wanted {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if !delivery.enqueuedAt.IsZero() {
+		if !sel.Since.IsZero() && delivery.enqueuedAt.Before(sel.Since) {
+			return false
+		}
+		if !sel.Until.IsZero() && delivery.enqueuedAt.After(sel.Until) {
+			return false
+		}
+	}
+	return true
+}
+
+// ResumeSelective confirms a recovery selection for a paused
+// subscription and resumes delivery. The selection is evaluated against
+// the backlog exactly as it stands when the call runs: selected messages
+// stay queued for replay in their original order, and the remainder is
+// either kept pending (delivered after the selected ones, still in
+// order) or abandoned with the caller's reason, depending on
+// RemainderPolicy. Nothing is marked delivered by the selection itself;
+// replay still goes through the normal pump handoff.
+//
+// Messages that arrive while the selection is being prepared or
+// confirmed are not covered by it: the selection binds only the backlog
+// snapshot it saw, and later arrivals follow the subscription's normal
+// matching and retention rules.
+//
+// Every confirmed selection is logged as a RecoveryDecision, persisted
+// with the subscription, so after a restart the decision log still
+// explains which messages were replayed, kept pending, or deliberately
+// abandoned — and abandoned messages appear as gaps with code
+// "recovery_abandoned", distinct from retention-policy gaps.
+func (r *Router) ResumeSelective(id string, sel RecoverySelection) (ResumeReport, error) {
+	if sel.Remainder == "" {
+		sel.Remainder = RemainderKeepPending
+	}
+	if sel.Remainder != RemainderKeepPending && sel.Remainder != RemainderAbandon {
+		err := fmt.Errorf("%w: unknown remainder policy %q", ErrInvalidSubscription, sel.Remainder)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "invalid_recovery_selection",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return ResumeReport{}, err
+	}
+	if sel.Remainder == RemainderAbandon && sel.Reason == "" {
+		err := fmt.Errorf("%w: abandoning backlog messages requires a reason", ErrInvalidSubscription)
+		r.addRecord(Record{
+			Kind:           RecordRejected,
+			Code:           "invalid_recovery_selection",
+			Reason:         err.Error(),
+			SubscriptionID: id,
+		})
+		return ResumeReport{}, err
+	}
+	entry, err := r.pausedSubscription(id)
+	if err != nil {
+		return ResumeReport{}, err
+	}
+
+	entry.mu.Lock()
+	// Snapshot the backlog under the lock; offers block for the duration
+	// of the rebuild, so a message is either part of this snapshot or
+	// arrives strictly after the selection was confirmed.
+	backlog := entry.backlogLocked()
+	decision := RecoveryDecision{
+		Time:           time.Now(),
+		SubscriptionID: id,
+		Selection: RecoverySelection{
+			RuleIDs:   append([]string(nil), sel.RuleIDs...),
+			Since:     sel.Since,
+			Until:     sel.Until,
+			Remainder: sel.Remainder,
+			Reason:    sel.Reason,
+		},
+		Reason: sel.Reason,
+	}
+	var kept []Delivery
+	var abandoned []Delivery
+	for _, delivery := range backlog {
+		switch {
+		case sel.selected(delivery):
+			kept = append(kept, delivery)
+			decision.Replayed = append(decision.Replayed, delivery.Message.id)
+		case sel.Remainder == RemainderAbandon:
+			abandoned = append(abandoned, delivery)
+			decision.Abandoned = append(decision.Abandoned, delivery.Message.id)
+		default:
+			kept = append(kept, delivery)
+			decision.KeptPending = append(decision.KeptPending, delivery.Message.id)
+		}
+	}
+	// Rebuild the backlog without the abandoned messages. The pump is
+	// paused, so nothing is in flight; folding the pending handoff back
+	// into the ring is safe and preserves the original order.
+	entry.pending = nil
+	entry.head = 0
+	entry.count = 0
+	for _, delivery := range kept {
+		entry.queued[entry.count%len(entry.queued)] = delivery
+		entry.count++
+	}
+	report := ResumeReport{SubscriptionID: id}
+	for _, delivery := range kept {
+		report.Replayable = append(report.Replayable, delivery.Message.id)
+	}
+	for _, gap := range entry.gaps {
+		report.Evicted = append(report.Evicted, gap.MessageID)
+		report.Gaps = append(report.Gaps, copyGap(gap))
+	}
+	for _, delivery := range abandoned {
+		gap := Gap{
+			MessageID:   delivery.Message.id,
+			Topic:       delivery.Message.topic,
+			Code:        "recovery_abandoned",
+			Reason:      sel.Reason,
+			RuleIDs:     append([]string(nil), delivery.RuleIDs...),
+			RuleVersion: delivery.RuleVersion,
+			Policy:      entry.overflow,
+		}
+		report.Evicted = append(report.Evicted, gap.MessageID)
+		report.Abandoned = append(report.Abandoned, gap.MessageID)
+		report.Gaps = append(report.Gaps, gap)
+	}
+	entry.gaps = nil
+	entry.decisions = append(entry.decisions, decision)
+	entry.paused = false
+	entry.signal()
+	entry.mu.Unlock()
+
+	for _, delivery := range abandoned {
+		r.addRecord(Record{
+			Time:           time.Now(),
+			Kind:           RecordDropped,
+			Code:           "recovery_abandoned",
+			Reason:         sel.Reason,
+			MessageID:      delivery.Message.id,
+			Topic:          delivery.Message.topic,
+			SubscriptionID: id,
+			RuleIDs:        append([]string(nil), delivery.RuleIDs...),
+			RuleVersion:    delivery.RuleVersion,
+		})
+	}
+	r.persist()
+	return report, nil
+}
+
+// RecoveryDecisions returns the confirmed recovery selections of an
+// active (including recovered) subscription, oldest first. The log is
+// empty for a freshly subscribed instance: cancelling and resubscribing
+// under the same name never carries old decisions over.
+func (r *Router) RecoveryDecisions(id string) []RecoveryDecision {
+	r.mu.RLock()
+	entry, ok := r.subscribers[id]
+	r.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	decisions := make([]RecoveryDecision, 0, len(entry.decisions))
+	for _, decision := range entry.decisions {
+		decision.Selection.RuleIDs = append([]string(nil), decision.Selection.RuleIDs...)
+		decision.Replayed = append([]string(nil), decision.Replayed...)
+		decision.KeptPending = append([]string(nil), decision.KeptPending...)
+		decision.Abandoned = append([]string(nil), decision.Abandoned...)
+		decisions = append(decisions, decision)
+	}
+	return decisions
 }
 
 func (r *Router) Records() []Record {
