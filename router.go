@@ -76,6 +76,17 @@ type Delivery struct {
 	// single atomic snapshot, so this value identifies exactly which revision
 	// of the rules produced the delivery.
 	RuleVersion int
+
+	// seq is a router-wide monotonically increasing offer number assigned
+	// when the delivery enters the backlog. Recovery-scope previews use it
+	// to freeze "the backlog as seen then": a later confirmation only
+	// applies to deliveries with seq at or below the preview's token, so
+	// messages that arrive between preview and confirm are never affected
+	// by the selection.
+	seq int64
+	// enqueuedAt is when the delivery entered the backlog; recovery
+	// selections can filter the replay scope by this time range.
+	enqueuedAt time.Time
 }
 
 // OverflowPolicy decides what happens when a slow subscriber's bounded
@@ -238,6 +249,16 @@ type subscription struct {
 	// with the reason, matched rules, and policy at gap time; Resume
 	// reports them as the replay gaps.
 	gaps []Gap
+	// abandoned records messages the user explicitly gave up through a
+	// confirmed recovery selection, with the user-supplied reason. It is
+	// persisted alongside gaps so a restart can still tell "the retention
+	// policy evicted this" apart from "a human chose to drop this".
+	abandoned []AbandonedRecord
+	// decisions is the audit trail of confirmed recovery selections:
+	// what scope was seen, what was chosen, and what happened to the
+	// remainder. Persisted so the history survives restarts; it belongs
+	// to this subscription instance and dies with it on Unsubscribe.
+	decisions []RecoveryDecision
 
 	notify   chan struct{}
 	inFlight sync.WaitGroup
@@ -256,6 +277,10 @@ type Router struct {
 	historySize int
 	subscribers map[string]*subscription
 
+	// seq assigns every offered delivery a router-wide monotonically
+	// increasing number; recovery-scope tokens are snapshots of it.
+	seqMu     sync.Mutex
+	seq       int64
 	store     *stateStore
 	recovered []RecoveryReport
 
@@ -313,10 +338,21 @@ func (r *Router) recover() error {
 			entry.queued[(entry.head+entry.count)%len(entry.queued)] = restored
 			entry.count++
 			report.Replayable = append(report.Replayable, restored.Message.id)
+			if restored.seq > r.seq {
+				r.seq = restored.seq
+			}
 		}
 		for _, gap := range persisted.Gaps {
 			entry.gaps = append(entry.gaps, copyGap(gap))
 			report.Gaps = append(report.Gaps, copyGap(gap))
+		}
+		for _, abandoned := range persisted.Abandoned {
+			entry.abandoned = append(entry.abandoned, copyAbandoned(abandoned))
+			report.Abandoned = append(report.Abandoned, copyAbandoned(abandoned))
+		}
+		for _, decision := range persisted.Decisions {
+			entry.decisions = append(entry.decisions, copyDecision(decision))
+			report.Decisions = append(report.Decisions, copyDecision(decision))
 		}
 		r.subscribers[persisted.ID] = entry
 		r.recovered = append(r.recovered, report)
@@ -337,6 +373,16 @@ func (r *Router) RecoveryReports() []RecoveryReport {
 			gaps = append(gaps, copyGap(gap))
 		}
 		report.Gaps = gaps
+		abandoned := make([]AbandonedRecord, 0, len(report.Abandoned))
+		for _, entry := range report.Abandoned {
+			abandoned = append(abandoned, copyAbandoned(entry))
+		}
+		report.Abandoned = abandoned
+		decisions := make([]RecoveryDecision, 0, len(report.Decisions))
+		for _, decision := range report.Decisions {
+			decisions = append(decisions, copyDecision(decision))
+		}
+		report.Decisions = decisions
 		reports = append(reports, report)
 	}
 	return reports
@@ -388,6 +434,12 @@ func (r *Router) persist() {
 		}
 		for _, gap := range entry.gaps {
 			persisted.Gaps = append(persisted.Gaps, copyGap(gap))
+		}
+		for _, abandoned := range entry.abandoned {
+			persisted.Abandoned = append(persisted.Abandoned, copyAbandoned(abandoned))
+		}
+		for _, decision := range entry.decisions {
+			persisted.Decisions = append(persisted.Decisions, copyDecision(decision))
 		}
 		entry.mu.Unlock()
 		state.Subscriptions = append(state.Subscriptions, persisted)
@@ -788,6 +840,8 @@ func (r *Router) Publish(message Message) error {
 			SubscriptionID: target.entry.id,
 			RuleIDs:        target.ruleIDs,
 			RuleVersion:    target.version,
+			seq:            r.nextSeq(),
+			enqueuedAt:     time.Now(),
 		}
 		discarded, code := target.entry.offer(delivery)
 		switch code {
@@ -1069,6 +1123,24 @@ func matchRules(rules []Rule, message Message) []string {
 func copyRecord(record Record) Record {
 	record.RuleIDs = append([]string(nil), record.RuleIDs...)
 	return record
+}
+
+// nextSeq allocates the next router-wide offer sequence number.
+func (r *Router) nextSeq() int64 {
+	r.seqMu.Lock()
+	defer r.seqMu.Unlock()
+	r.seq++
+	return r.seq
+}
+
+// currentSeq reports the highest offer sequence number allocated so far.
+// A recovery-scope preview uses it as its token: anything offered after
+// the preview carries a higher number and is therefore outside the scope
+// a later confirmation can touch.
+func (r *Router) currentSeq() int64 {
+	r.seqMu.Lock()
+	defer r.seqMu.Unlock()
+	return r.seq
 }
 
 func maxInt(a, b int) int {

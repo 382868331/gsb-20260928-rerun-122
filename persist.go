@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 // Gap describes a message the retention policy discarded while the
@@ -45,6 +46,14 @@ type RecoveryReport struct {
 	// Gaps lists the messages the retention policy discarded while the
 	// subscription was paused, with the reason and rules at gap time.
 	Gaps []Gap
+	// Abandoned lists messages a confirmed recovery selection gave up on
+	// purpose, with the user-supplied reason. Unlike Gaps, these were
+	// never lost to the retention policy: a human chose to drop them.
+	Abandoned []AbandonedRecord
+	// Decisions is the persisted audit trail of every confirmed recovery
+	// selection for this subscription instance, so a restart can still
+	// explain why the backlog looks the way it does.
+	Decisions []RecoveryDecision
 }
 
 // persistedMessage is the serializable form of Message.
@@ -58,6 +67,8 @@ type persistedDelivery struct {
 	Message     persistedMessage `json:"message"`
 	RuleIDs     []string         `json:"rule_ids,omitempty"`
 	RuleVersion int              `json:"rule_version"`
+	Seq         int64            `json:"seq"`
+	EnqueuedAt  time.Time        `json:"enqueued_at"`
 }
 
 type persistedSubscription struct {
@@ -69,6 +80,11 @@ type persistedSubscription struct {
 	Paused     bool                `json:"paused"`
 	Backlog    []persistedDelivery `json:"backlog,omitempty"`
 	Gaps       []Gap               `json:"gaps,omitempty"`
+	// Abandoned and Decisions keep the recovery-selection history of
+	// this exact subscription instance. Unsubscribe removes the whole
+	// entry, so a same-name resubscribe never inherits them.
+	Abandoned []AbandonedRecord  `json:"abandoned,omitempty"`
+	Decisions []RecoveryDecision `json:"decisions,omitempty"`
 }
 
 type persistedState struct {
@@ -96,6 +112,8 @@ func persistDelivery(delivery Delivery) persistedDelivery {
 		Message:     persistMessage(delivery.Message),
 		RuleIDs:     append([]string(nil), delivery.RuleIDs...),
 		RuleVersion: delivery.RuleVersion,
+		Seq:         delivery.seq,
+		EnqueuedAt:  delivery.enqueuedAt,
 	}
 }
 
@@ -105,6 +123,8 @@ func restoreDelivery(subscriptionID string, delivery persistedDelivery) Delivery
 		SubscriptionID: subscriptionID,
 		RuleIDs:        append([]string(nil), delivery.RuleIDs...),
 		RuleVersion:    delivery.RuleVersion,
+		seq:            delivery.Seq,
+		enqueuedAt:     delivery.EnqueuedAt,
 	}
 }
 
